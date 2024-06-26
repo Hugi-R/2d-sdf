@@ -13,9 +13,10 @@
 
 // Return codes
 #define OK 0
-#define E_PARSE_NUMBER -10
-#define E_PARSE_ISEGMENT_BAD_INDEX -10
-#define E_UNSUPPORTED_WKT -20
+#define E_PARSE_UNSUPPORTED -10
+#define E_PARSE_NUMBER -11
+#define E_PARSE_ISEGMENT_BAD_INDEX -12
+#define E_PARSE_NEED_LAYER -13
 #define E_RENDER_INVALID_COORD -30
 
 #define LOG_E(FORMAT, ...) fprintf(stderr, "%s:%d ERROR: " FORMAT "\n", __FILE__, __LINE__, __VA_ARGS__);
@@ -68,7 +69,7 @@ typedef struct Scene {
 } Scene;
 
 // Definitions
-int parse_line(Layer* layer, char* line, size_t* cursor, size_t line_size);
+int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size);
 // ===
 
 int parse_number(char* str, size_t* cursor, size_t stop, float* number) {
@@ -184,12 +185,12 @@ int parse_isegment(Layer* layer, char* line, size_t* cursor, size_t line_size, S
 }
 
 // Parse ROUND(N ...)
-int parse_round(Layer* layer, char* line, size_t* cursor, size_t line_size, Geom* geom) {
+int parse_round(Scene* scene, char* line, size_t* cursor, size_t line_size, Geom* geom) {
     int res = OK;
     *cursor += 6; // Skip ROUND(
     END_IF_NOK(parse_number(line, cursor, line_size, &(geom->round_r)))
     *cursor += 1; // Skip the separator space
-    END_IF_NOK(parse_line(layer, line, cursor, line_size))
+    END_IF_NOK(parse_line(scene, line, cursor, line_size))
     *cursor += 1; // Skip the )
     geom->round_r *= DIAG;
 
@@ -198,16 +199,21 @@ int parse_round(Layer* layer, char* line, size_t* cursor, size_t line_size, Geom
 
 // Parse LAYER(N)
 // Where N can be any of "Fusion types"
-int parse_layer(Layer* layer, char* line, size_t* cursor, size_t line_size) {
+int parse_layer(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     int res = OK;
+    int fusion;
     *cursor += 6; // Skip LAYER(
-    END_IF_NOK(parse_int(line, cursor, line_size, &(layer->fusion)))
+    END_IF_NOK(parse_int(line, cursor, line_size, &fusion))
     *cursor += 1; // Skip the )
+
+    scene->size += 1;
+    scene->layer[scene->size - 1].fusion = fusion;
+    scene->layer[scene->size - 1].size = 0;
 
     return res;
 }
 
-int parse_line(Layer* layer, char* line, size_t* cursor, size_t line_size) {
+int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     int res = 0;
     char wkt_type[32];
     size_t wkt_type_size = 0;
@@ -216,8 +222,19 @@ int parse_line(Layer* layer, char* line, size_t* cursor, size_t line_size) {
     }
     wkt_type[wkt_type_size] = '\0';
 
+    if (strcmp(wkt_type, "LAYER") == 0) {
+        END_IF_NOK(parse_layer(scene, line, cursor, line_size))
+        return OK;
+    }
+
+    if (scene->size == 0) {
+        LOG_E("Trying to create geometries without layer, your first instruction should be a LAYER, got %s", line);
+        return E_PARSE_NEED_LAYER;
+    }
+
+    Layer* layer = &(scene->layer[scene->size-1]);
     if (strcmp(wkt_type, "ROUND") == 0) {
-        END_IF_NOK(parse_round(layer, line, cursor, line_size, &(layer->geoms[layer->size])))
+        END_IF_NOK(parse_round(scene, line, cursor, line_size, &(layer->geoms[layer->size])))
     } else if (strcmp(wkt_type, "POINT") == 0) {
         layer->geoms[layer->size].type = POINT;
         END_IF_NOK(parse_point(line, cursor, line_size, &(layer->geoms[layer->size].point)))
@@ -230,11 +247,9 @@ int parse_line(Layer* layer, char* line, size_t* cursor, size_t line_size) {
         layer->geoms[layer->size].type = SEGMENT;
         END_IF_NOK(parse_isegment(layer, line, cursor, line_size, &(layer->geoms[layer->size].segment)))
         layer->size += 1;
-    } else if (strcmp(wkt_type, "LAYER") == 0) {
-        END_IF_NOK(parse_layer(layer, line, cursor, line_size))
     } else {
-        LOG_E("Unsuported WKT: %s", line);
-        return E_UNSUPPORTED_WKT;
+        LOG_E("Unsuported word %s in line %s", wkt_type, line);
+        return E_PARSE_UNSUPPORTED;
     }
 
     return res;
@@ -282,7 +297,7 @@ float sdSegment(Point p, Point a, Point b ) {
     return length(sub(pa, mul(ba, h)));
 }
 
-void sdRender(Layer layer, float x, float y, unsigned char pixel[3]) {
+void sdRenderLayer(Layer layer, float x, float y, unsigned char pixel[3]) {
     float d = CANVAS_HEIGHT*CANVAS_WIDTH;
     Point p = {x, y};
     for (size_t i = 0; i < layer.size; i++) {
@@ -321,6 +336,12 @@ void sdRender(Layer layer, float x, float y, unsigned char pixel[3]) {
             pixel[2] = (unsigned char) (rgba[0] * 255)*opacity;
             break;
         }
+    }
+}
+
+void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3]) {
+    for (size_t i = 0; i < scene->size; i++) {
+        sdRenderLayer(scene->layer[i], x, y, pixel);
     }
 }
 
@@ -386,7 +407,7 @@ unsigned char* create_bitmap_info_header(int height, int width) {
 
 /* === */
 
-int write_bitmap(Layer layer, char* imageFileName)
+int write_bitmap(Scene* scene, char* imageFileName)
 {
     int widthInBytes = CANVAS_WIDTH * BYTES_PER_PIXEL;
 
@@ -406,7 +427,7 @@ int write_bitmap(Layer layer, char* imageFileName)
     for (int y = 0; y < CANVAS_HEIGHT; y++) {
         for (int x = 0; x < CANVAS_WIDTH; x++) {
             unsigned char pixel[] = {0, 0, 0};
-            sdRender(layer, x, y, pixel);
+            sdRenderScene(scene, x, y, pixel);
             fwrite(pixel, BYTES_PER_PIXEL, 1, imageFile);
         }
         fwrite(padding, 1, paddingSize, imageFile);
@@ -418,6 +439,7 @@ int write_bitmap(Layer layer, char* imageFileName)
 int main(void) {
     DIAG = sqrt(CANVAS_WIDTH*CANVAS_WIDTH + CANVAS_HEIGHT*CANVAS_HEIGHT);
     Scene scene;
+    scene.size = 0;
 
     FILE* fp;
     char* line = NULL;
@@ -428,18 +450,17 @@ int main(void) {
     if (fp == NULL)
         exit(EXIT_FAILURE);
 
-    scene.layer[0].size = 0;
     int res = OK;
-    while ((read = getline(&line, &len, fp)) != -1 && scene.layer[0].size < MAX_GEOMS_PER_LAYER) {
+    while ((read = getline(&line, &len, fp)) != -1) {
         size_t cursor = 0;
         line[--read] = '\0'; // Remove LF (will break on LFLR)
-        if((res = parse_line(&(scene.layer[0]), line, &cursor, read)) == OK) {
+        if((res = parse_line(&scene, line, &cursor, read)) == OK) {
         } else {
             LOG_E("Got error %d for line: %s", res, line);
         }
     }
 
-    write_bitmap(scene.layer[0], "canvas.bmp");
+    write_bitmap(&scene, "canvas.bmp");
 
     fclose(fp);
     if (line)
