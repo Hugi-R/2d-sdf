@@ -40,39 +40,46 @@ static float DIAG;
 #define F_MIN 0
 #define F_SMIN 1
 
-typedef struct Point {
+typedef struct Geom Geom;
+typedef struct Segment Segment;
+typedef struct Point Point;
+typedef struct Layer Layer;
+typedef struct Scene Scene;
+typedef struct RichDistance RichDistance; 
+
+struct Point {
     float x;
     float y;
     float rgba[4];
-} Point;
+};
 
-typedef struct Segment {
-    Point a;
-    Point b;
-} Segment;
+struct Segment {
+    Geom* a;
+    Geom* b;
+};
 
-typedef struct Geom {
+struct Geom {
     char type; // See "Geom types"
     Point point;
     Segment segment;
     float round_r;
-} Geom;
+};
 
-typedef struct Layer {
+struct Layer {
     int fusion; // See "Fusion types"
     Geom geoms[MAX_GEOMS_PER_LAYER];
     size_t size;
-} Layer;
+};
 
-typedef struct Scene {
+struct Scene {
     Layer layer[MAX_LAYER];
     size_t size;
-} Scene;
+};
 
-typedef struct RichDistance {
+struct RichDistance {
     float d;
     float rgba[4];
-} RichDistance;
+};
 
 // Definitions
 int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size);
@@ -151,37 +158,25 @@ int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
     return res;
 }
 
-// Parse SEGMENT(POINT(...) POINT(...))
-int parse_segment(char* line, size_t* cursor, size_t line_size, Segment* seg) {
-    int res = OK;
-    *cursor += 8; // Skip SEGMENT(
-    END_IF_NOK(parse_point(line, cursor, line_size, &(seg->a)))
-    *cursor += 1; // Skip the separator space
-    END_IF_NOK(parse_point(line, cursor, line_size, &(seg->b)))
-    *cursor += 1; // Skip the )
-
-    return res;
-}
-
 // Parse ISEGMENT(N N)
 // Where N is the index of a Point Geom in the Layer
-int parse_isegment(Layer* layer, char* line, size_t* cursor, size_t line_size, Segment* seg) {
+int parse_segment(Layer* layer, char* line, size_t* cursor, size_t line_size, Segment* seg) {
     int res = OK;
     int ia, ib;
-    *cursor += 9; // Skip ISEGMENT(
+    *cursor += 8; // Skip SEGMENT(
     END_IF_NOK(parse_int(line, cursor, line_size, &ia))
     *cursor += 1; // Skip the separator space
     END_IF_NOK(parse_int(line, cursor, line_size, &ib))
     *cursor += 1; // Skip the )
 
     if (ia >= 0 && ia < layer->size && layer->geoms[ia].type == POINT) {
-        seg->a = layer->geoms[ia].point;
+        seg->a = &(layer->geoms[ia]);
     } else {
         LOG_E("Bad Point Geom index %d", ia);
         return E_PARSE_ISEGMENT_BAD_INDEX;
     }
     if (ib >= 0 && ib < layer->size && layer->geoms[ib].type == POINT) {
-        seg->b = layer->geoms[ib].point;
+        seg->b = &(layer->geoms[ib]);
     } else {
         LOG_E("Bad Point Geom index %d", ib);
         return E_PARSE_ISEGMENT_BAD_INDEX;
@@ -255,11 +250,7 @@ int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
         layer->size += 1;
     } else if (strcmp(wkt_type, "SEGMENT") == 0) {
         layer->geoms[layer->size].type = SEGMENT;
-        END_IF_NOK(parse_segment(line, cursor, line_size, &(layer->geoms[layer->size].segment)))
-        layer->size += 1;
-    } else if (strcmp(wkt_type, "ISEGMENT") == 0) {
-        layer->geoms[layer->size].type = SEGMENT;
-        END_IF_NOK(parse_isegment(layer, line, cursor, line_size, &(layer->geoms[layer->size].segment)))
+        END_IF_NOK(parse_segment(layer, line, cursor, line_size, &(layer->geoms[layer->size].segment)))
         layer->size += 1;
     } else {
         LOG_E("Unsuported word %s in line %s", wkt_type, line);
@@ -338,16 +329,27 @@ RichDistance sdPoint(Point p, Point a) {
     return rd;
 }
 
-RichDistance sdSegment(Point p, Point a, Point b ) {
+RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     RichDistance rd;
+    Point a = ag->point;
+    Point b = bg->point;
+    // Calculate distance
     Point pa = sub(p, a);
     Point ba = sub(b, a);
-    float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0);
+    float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0); // h is the projection of the Point p on segment AB, with value 0 for A, and 1 for B
     rd.d = length(sub(pa, mul(ba, h)));
-    rd.rgba[0] = a.rgba[0]*(1-h) + b.rgba[0]*h;
-    rd.rgba[1] = a.rgba[1]*(1-h) + b.rgba[1]*h;
-    rd.rgba[2] = a.rgba[2]*(1-h) + b.rgba[2]*h;
-    rd.rgba[3] = a.rgba[3]*(1-h) + b.rgba[3]*h;
+
+    // Calculate color gradiant.
+    // We want the gradiant to start from the edge of the circle, which add some complexity
+    float dab = length(sub(b, a));
+    float ar = ag->round_r / dab; // Where the color gradiant start for A, on segment AB
+    float br = bg->round_r / dab; // Where the color gradiant start for B, on segment BA
+    float ch = clamp(h-ar, 0, (1-(ar+br))) / (1 - (ar+br)); // h for color, ar become the 0 of ch, and br become the 1
+    rd.rgba[0] = a.rgba[0]*(1-ch) + b.rgba[0]*ch;
+    rd.rgba[1] = a.rgba[1]*(1-ch) + b.rgba[1]*ch;
+    rd.rgba[2] = a.rgba[2]*(1-ch) + b.rgba[2]*ch;
+    rd.rgba[3] = a.rgba[3]*(1-ch) + b.rgba[3]*ch;
+    
     return rd;
 }
 
