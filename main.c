@@ -11,24 +11,37 @@
 #include "string.h"
 #include "math.h"
 
-#define CANVAS_WIDTH 800
-#define CANVAS_HEIGHT 400
-#define MAX_GEOMS 1000
-static double DIAG;
-
-// WKT types
-#define POINT 0
-#define SEGMENT 1
-
 // Return codes
 #define OK 0
 #define E_PARSE_NUMBER -10
+#define E_PARSE_ISEGMENT_BAD_INDEX -10
 #define E_UNSUPPORTED_WKT -20
 #define E_RENDER_INVALID_COORD -30
 
+#define LOG_E(FORMAT, ...) fprintf(stderr, "%s:%d ERROR: " FORMAT "\n", __FILE__, __LINE__, __VA_ARGS__);
+#define END_IF_NOK(X) if ((res = X) != OK) {return res;}
+#define min(X, Y) ((X) < (Y) ? (X) : (Y))
+#define max(X, Y) ((X) > (Y) ? (X) : (Y))
+#define clamp(V, VMIN, VMAX) max(VMIN, min(VMAX, V))
+
+#define CANVAS_WIDTH 800
+#define CANVAS_HEIGHT 400
+#define MAX_GEOMS_PER_LAYER 100
+#define MAX_LAYER 100
+static float DIAG;
+
+// Geom types
+#define POINT 0
+#define SEGMENT 1
+
+// Fusion types
+#define F_MIN 0
+#define F_SMIN 1
+
 typedef struct Point {
-    double x;
-    double y;
+    float x;
+    float y;
+    float rgba[4];
 } Point;
 
 typedef struct Segment {
@@ -37,78 +50,164 @@ typedef struct Segment {
 } Segment;
 
 typedef struct Geom {
-    char type; // See "WKT types"
+    char type; // See "Geom types"
     Point point;
     Segment segment;
-    double round_r;
+    float round_r;
 } Geom;
 
+typedef struct Layer {
+    int fusion; // See "Fusion types"
+    Geom geoms[MAX_GEOMS_PER_LAYER];
+    size_t size;
+} Layer;
+
+typedef struct Scene {
+    Layer layer[MAX_LAYER];
+    size_t size;
+} Scene;
+
 // Definitions
-int parse_line(char* line, size_t* cursor, size_t line_size, Geom* geo);
+int parse_line(Layer* layer, char* line, size_t* cursor, size_t line_size);
 // ===
 
-int parse_number(char* str, size_t* cursor, size_t stop, double* number) {
+int parse_number(char* str, size_t* cursor, size_t stop, float* number) {
     char num[32];
+    if (*cursor > stop) {
+        LOG_E("Failed to read number, cursor value %ld is above stop %ld", *cursor, stop);
+        return E_PARSE_NUMBER;
+    }
     size_t start = *cursor;
     for (; *cursor < stop && (*cursor - start) < 32 && str[*cursor] != ' ' && str[*cursor] != ')'; *cursor += 1) {
         num[*cursor - start] = str[*cursor];
     }
+    num[*cursor - start] = '\0';
     if (str[*cursor] != ' ' && str[*cursor] != ')') {
-        fprintf(stderr, "Failed to read number from: %s", str);
+        LOG_E("Failed to read number, got: %s", num);
         return E_PARSE_NUMBER;
     }
-    num[*cursor - start] = '\0';
 
     *number = atof(num);
     return OK;
 }
 
+int parse_int(char* str, size_t* cursor, size_t stop, int* number) {
+    int res = OK;
+    float x = 0;
+    END_IF_NOK(parse_number(str, cursor, stop, &x))
+    *number = (int) x;
+    if (((float) *number) != x) {
+        LOG_E("Failed to read number from: %s. Expected an integer.", str);
+        res = E_PARSE_NUMBER;
+    }
+
+    return res;
+}
+
+// Parse COLOR(N N N N)
+int parse_color(char* line, size_t* cursor, size_t line_size, Point* point) {
+    int res = OK;
+    *cursor += 6; // Skip COLOR(
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->rgba[0])))
+    *cursor += 1; // Skip the separator space
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->rgba[1])))
+    *cursor += 1; // Skip the separator space
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->rgba[2])))
+    *cursor += 1; // Skip the separator space
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->rgba[3])))
+    *cursor += 1; // Skip the )
+
+    return res;
+}
+
+// Parse POINT(N N COLOR(...))
+// COLOR(...) is optional
 int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
     int res = OK;
     *cursor += 6; // Skip POINT(
-    if((res = parse_number(line, cursor, line_size, &(point->x))) != OK) {
-        return res;
-    }
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->x)))
     *cursor += 1; // Skip the separator space
-    if((res = parse_number(line, cursor, line_size, &(point->y))) != OK) {
-        return res;
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->y)))
+    *cursor += 1; // Skip the separator space
+    if (line[*cursor] == 'C') {
+        END_IF_NOK(parse_color(line, cursor, line_size, point))
+    } else {
+        point->rgba[0] = 1;
+        point->rgba[1] = 0;
+        point->rgba[2] = 1;
+        point->rgba[3] = 1;
     }
     *cursor += 1; // Skip the )
     point->x *= CANVAS_WIDTH;
     point->y *= CANVAS_HEIGHT;
+
     return res;
 }
 
-int parse_segment(char* line, size_t* cursor, size_t line_size, Geom* geom) {
+// Parse SEGMENT(POINT(...) POINT(...))
+int parse_segment(char* line, size_t* cursor, size_t line_size, Segment* seg) {
     int res = OK;
     *cursor += 8; // Skip SEGMENT(
-    if ((res = parse_point(line, cursor, line_size, &(geom->segment.a))) != OK) {
-        return res;
-    }
+    END_IF_NOK(parse_point(line, cursor, line_size, &(seg->a)))
     *cursor += 1; // Skip the separator space
-    if ((res = parse_point(line, cursor, line_size, &(geom->segment.b))) != OK) {
-        return res;
-    }
+    END_IF_NOK(parse_point(line, cursor, line_size, &(seg->b)))
     *cursor += 1; // Skip the )
+
     return res;
 }
 
-int parse_round(char* line, size_t* cursor, size_t line_size, Geom* geom) {
+// Parse ISEGMENT(N N)
+// Where N is the index of a Point Geom in the Layer
+int parse_isegment(Layer* layer, char* line, size_t* cursor, size_t line_size, Segment* seg) {
+    int res = OK;
+    int ia, ib;
+    *cursor += 9; // Skip ISEGMENT(
+    END_IF_NOK(parse_int(line, cursor, line_size, &ia))
+    *cursor += 1; // Skip the separator space
+    END_IF_NOK(parse_int(line, cursor, line_size, &ib))
+    *cursor += 1; // Skip the )
+
+    if (ia >= 0 && ia < layer->size && layer->geoms[ia].type == POINT) {
+        seg->a = layer->geoms[ia].point;
+    } else {
+        LOG_E("Bad Point Geom index %d", ia);
+        return E_PARSE_ISEGMENT_BAD_INDEX;
+    }
+    if (ib >= 0 && ib < layer->size && layer->geoms[ib].type == POINT) {
+        seg->b = layer->geoms[ib].point;
+    } else {
+        LOG_E("Bad Point Geom index %d", ib);
+        return E_PARSE_ISEGMENT_BAD_INDEX;
+    }
+
+    return res;
+}
+
+// Parse ROUND(N ...)
+int parse_round(Layer* layer, char* line, size_t* cursor, size_t line_size, Geom* geom) {
     int res = OK;
     *cursor += 6; // Skip ROUND(
-    if((res = parse_line(line, cursor, line_size, geom)) != OK) {
-        return res;
-    }
+    END_IF_NOK(parse_number(line, cursor, line_size, &(geom->round_r)))
     *cursor += 1; // Skip the separator space
-    if((res = parse_number(line, cursor, line_size, &(geom->round_r))) != OK) {
-        return res;
-    }
+    END_IF_NOK(parse_line(layer, line, cursor, line_size))
     *cursor += 1; // Skip the )
     geom->round_r *= DIAG;
+
     return res;
 }
 
-int parse_line(char* line, size_t* cursor, size_t line_size, Geom* geo) {
+// Parse LAYER(N)
+// Where N can be any of "Fusion types"
+int parse_layer(Layer* layer, char* line, size_t* cursor, size_t line_size) {
+    int res = OK;
+    *cursor += 6; // Skip LAYER(
+    END_IF_NOK(parse_int(line, cursor, line_size, &(layer->fusion)))
+    *cursor += 1; // Skip the )
+
+    return res;
+}
+
+int parse_line(Layer* layer, char* line, size_t* cursor, size_t line_size) {
     int res = 0;
     char wkt_type[32];
     size_t wkt_type_size = 0;
@@ -117,22 +216,24 @@ int parse_line(char* line, size_t* cursor, size_t line_size, Geom* geo) {
     }
     wkt_type[wkt_type_size] = '\0';
 
-    if (strcmp(wkt_type, "POINT") == 0) {
-        geo->type = POINT;
-        if ((res = parse_point(line, cursor, line_size, &(geo->point))) != OK) {
-            return res;
-        }
-    } else if (strcmp(wkt_type, "ROUND") == 0) {
-        if ((res = parse_round(line, cursor, line_size, geo)) != OK) {
-            return res;
-        }
+    if (strcmp(wkt_type, "ROUND") == 0) {
+        END_IF_NOK(parse_round(layer, line, cursor, line_size, &(layer->geoms[layer->size])))
+    } else if (strcmp(wkt_type, "POINT") == 0) {
+        layer->geoms[layer->size].type = POINT;
+        END_IF_NOK(parse_point(line, cursor, line_size, &(layer->geoms[layer->size].point)))
+        layer->size += 1;
     } else if (strcmp(wkt_type, "SEGMENT") == 0) {
-        geo->type = SEGMENT;
-        if ((res = parse_segment(line, cursor, line_size, geo)) != OK) {
-            return res;
-        }
+        layer->geoms[layer->size].type = SEGMENT;
+        END_IF_NOK(parse_segment(line, cursor, line_size, &(layer->geoms[layer->size].segment)))
+        layer->size += 1;
+    } else if (strcmp(wkt_type, "ISEGMENT") == 0) {
+        layer->geoms[layer->size].type = SEGMENT;
+        END_IF_NOK(parse_isegment(layer, line, cursor, line_size, &(layer->geoms[layer->size].segment)))
+        layer->size += 1;
+    } else if (strcmp(wkt_type, "LAYER") == 0) {
+        END_IF_NOK(parse_layer(layer, line, cursor, line_size))
     } else {
-        fprintf(stderr, "Unsuported WKT: %s", line);
+        LOG_E("Unsuported WKT: %s", line);
         return E_UNSUPPORTED_WKT;
     }
 
@@ -141,8 +242,8 @@ int parse_line(char* line, size_t* cursor, size_t line_size, Geom* geo) {
 
 /* Signed Distance Functions, from https://iquilezles.org/articles/distfunctions2d/ */
 
-double length(Point p) {
-    return p.x*p.x + p.y*p.y;
+float length(Point p) {
+    return sqrt(p.x*p.x + p.y*p.y);
 }
 
 Point sub(Point a, Point b) {
@@ -150,70 +251,74 @@ Point sub(Point a, Point b) {
     return c;
 }
 
-Point mul(Point a, double s) {
+Point mul(Point a, float s) {
     Point c = {a.x * s, a.y * s};
     return c;
 }
 
-double dot(Point a, Point b) {
+float dot(Point a, Point b) {
     return a.x*b.x + a.y*b.y;
 }
 
-double min(double a, double b) {
-    return a < b ? a : b;
-}
-
 // Smooth min using the root method
-double smin( double a, double b, float k ) {
+float smin( float a, float b, float k ) {
     k *= 2.0;
     float x = b-a;
     return 0.5*(a+b-sqrt(x*x+k*k));
 }
 
-double max(double a, double b) {
-    return a > b ? a : b;
-}
-
-double clamp(double v, double vmin, double vmax) {
-    return max(vmin, min(vmax, v));
-}
-
-double opRound(double d, double r) {
+float opRound(float d, float r) {
     return d - r;
 }
 
-double sdPoint(Point p, Point a) {
+float sdPoint(Point p, Point a) {
     return length(sub(p, a));
 }
 
 float sdSegment(Point p, Point a, Point b ) {
     Point pa = sub(p, a);
     Point ba = sub(b, a);
-    double h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0);
+    float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0);
     return length(sub(pa, mul(ba, h)));
 }
 
-void sdRender(Geom geoms[MAX_GEOMS], size_t size, double x, double y, unsigned char pixel[3]) {
-    double d = CANVAS_HEIGHT*CANVAS_WIDTH;
+void sdRender(Layer layer, float x, float y, unsigned char pixel[3]) {
+    float d = CANVAS_HEIGHT*CANVAS_WIDTH;
     Point p = {x, y};
-    for (size_t i = 0; i < size; i++) {
-        switch (geoms[i].type)
+    for (size_t i = 0; i < layer.size; i++) {
+        float gd = 0;
+        float* rgba = NULL;
+        switch (layer.geoms[i].type)
         {
         case POINT:
-            d = min(d, opRound(sdPoint(p, geoms[i].point), geoms[i].round_r));
+            gd = opRound(sdPoint(p, layer.geoms[i].point), layer.geoms[i].round_r);
+            rgba = layer.geoms[i].point.rgba;
             break;
         case SEGMENT:
-            d = min(d, opRound(sdSegment(p, geoms[i].segment.a, geoms[i].segment.b), geoms[i].round_r));
+            gd = opRound(sdSegment(p, layer.geoms[i].segment.a, layer.geoms[i].segment.b), layer.geoms[i].round_r);
+            rgba = layer.geoms[i].segment.a.rgba;
             break;
         default:
             break;
         }
 
-        double opacity = clamp(0.5-d, 0, 1);
-        if (opacity > 0.5) {
-            pixel[0] = (unsigned char) ((i * 2) % 255)*opacity;
-            pixel[1] = (unsigned char) ((100 + i) % 255)*opacity;
-            pixel[2] = (unsigned char) ((50 / (i + 1)) % 255)*opacity;
+        switch (layer.fusion)
+        {
+        case F_MIN:
+            d = min(d, gd);
+            break;
+        case F_SMIN:
+            d = smin(d, gd, 2);
+            break;
+        default:
+            break;
+        }
+
+        float opacity = clamp(0.5-d, 0, 1);
+        if (opacity > 0) {
+            pixel[0] = (unsigned char) (rgba[2] * 255)*opacity;
+            pixel[1] = (unsigned char) (rgba[1] * 255)*opacity;
+            pixel[2] = (unsigned char) (rgba[0] * 255)*opacity;
             break;
         }
     }
@@ -281,7 +386,7 @@ unsigned char* create_bitmap_info_header(int height, int width) {
 
 /* === */
 
-int write_bitmap(Geom geoms[MAX_GEOMS], size_t size, char* imageFileName)
+int write_bitmap(Layer layer, char* imageFileName)
 {
     int widthInBytes = CANVAS_WIDTH * BYTES_PER_PIXEL;
 
@@ -301,7 +406,7 @@ int write_bitmap(Geom geoms[MAX_GEOMS], size_t size, char* imageFileName)
     for (int y = 0; y < CANVAS_HEIGHT; y++) {
         for (int x = 0; x < CANVAS_WIDTH; x++) {
             unsigned char pixel[] = {0, 0, 0};
-            sdRender(geoms, size, x, y, pixel);
+            sdRender(layer, x, y, pixel);
             fwrite(pixel, BYTES_PER_PIXEL, 1, imageFile);
         }
         fwrite(padding, 1, paddingSize, imageFile);
@@ -312,26 +417,29 @@ int write_bitmap(Geom geoms[MAX_GEOMS], size_t size, char* imageFileName)
 
 int main(void) {
     DIAG = sqrt(CANVAS_WIDTH*CANVAS_WIDTH + CANVAS_HEIGHT*CANVAS_HEIGHT);
-    Geom geoms[MAX_GEOMS];
+    Scene scene;
 
     FILE* fp;
     char* line = NULL;
     size_t len = 0;
     ssize_t read;
 
-    fp = fopen("segments.wkt", "r");
+    fp = fopen("data.wkt", "r");
     if (fp == NULL)
         exit(EXIT_FAILURE);
 
-    size_t i = 0;
-    while ((read = getline(&line, &len, fp)) != -1 && i < MAX_GEOMS) {
+    scene.layer[0].size = 0;
+    int res = OK;
+    while ((read = getline(&line, &len, fp)) != -1 && scene.layer[0].size < MAX_GEOMS_PER_LAYER) {
         size_t cursor = 0;
-        if(parse_line(line, &cursor, len, &geoms[i]) == OK) {
-            i++;
+        line[--read] = '\0'; // Remove LF (will break on LFLR)
+        if((res = parse_line(&(scene.layer[0]), line, &cursor, read)) == OK) {
+        } else {
+            LOG_E("Got error %d for line: %s", res, line);
         }
     }
 
-    write_bitmap(geoms, i, "canvas.bmp");
+    write_bitmap(scene.layer[0], "canvas.bmp");
 
     fclose(fp);
     if (line)
