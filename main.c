@@ -13,6 +13,7 @@
 
 // Return codes
 #define OK 0
+#define E_BOUND_REACHED -1
 #define E_PARSE_UNSUPPORTED -10
 #define E_PARSE_NUMBER -11
 #define E_PARSE_ISEGMENT_BAD_INDEX -12
@@ -67,6 +68,11 @@ typedef struct Scene {
     Layer layer[MAX_LAYER];
     size_t size;
 } Scene;
+
+typedef struct RichDistance {
+    float d;
+    float rgba[4];
+} RichDistance;
 
 // Definitions
 int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size);
@@ -223,6 +229,10 @@ int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     wkt_type[wkt_type_size] = '\0';
 
     if (strcmp(wkt_type, "LAYER") == 0) {
+        if (scene->size >= MAX_LAYER) {
+            LOG_E("Reached max layer count %d", MAX_LAYER);
+            return E_BOUND_REACHED;
+        }
         END_IF_NOK(parse_layer(scene, line, cursor, line_size))
         return OK;
     }
@@ -233,6 +243,10 @@ int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     }
 
     Layer* layer = &(scene->layer[scene->size-1]);
+    if (layer->size >= MAX_GEOMS_PER_LAYER) {
+        LOG_E("Reached max geom count %d for layer %ld", MAX_GEOMS_PER_LAYER, scene->size-1);
+        return E_BOUND_REACHED;
+    }
     if (strcmp(wkt_type, "ROUND") == 0) {
         END_IF_NOK(parse_round(scene, line, cursor, line_size, &(layer->geoms[layer->size])))
     } else if (strcmp(wkt_type, "POINT") == 0) {
@@ -261,6 +275,10 @@ float length(Point p) {
     return sqrt(p.x*p.x + p.y*p.y);
 }
 
+float mix(float x, float y, float a) {
+    return x*(1-a) + y*a;
+}
+
 Point sub(Point a, Point b) {
     Point c = {a.x - b.x, a.y - b.y};
     return c;
@@ -282,36 +300,69 @@ float smin( float a, float b, float k ) {
     return 0.5*(a+b-sqrt(x*x+k*k));
 }
 
-float opRound(float d, float r) {
-    return d - r;
+// Smooth min using the quadratic method
+Point sminq( float a, float b, float k )
+{
+    float h = 1.0 - min( abs(a-b)/(6.0*k), 1.0 );
+    float w = h*h*h;
+    float m = w*0.5;
+    float s = w*k;
+    Point ra = {a-s,m};
+    Point rb = {b-s,1.0-m};
+    return (a<b) ? ra : rb;
 }
 
-float sdPoint(Point p, Point a) {
-    return length(sub(p, a));
+RichDistance sdMin(RichDistance a, RichDistance b) {
+    Point sd = sminq(a.d, b.d, 1);
+    RichDistance rd;
+    rd.d = sd.x;
+    rd.rgba[0] = mix(a.rgba[0], b.rgba[0], sd.y);
+    rd.rgba[1] = mix(a.rgba[1], b.rgba[1], sd.y);
+    rd.rgba[2] = mix(a.rgba[2], b.rgba[2], sd.y);
+    rd.rgba[3] = mix(a.rgba[3], b.rgba[3], sd.y);
+    return rd;
 }
 
-float sdSegment(Point p, Point a, Point b ) {
+RichDistance opRound(RichDistance rd, float r) {
+    rd.d -= r; 
+    return rd;
+}
+
+RichDistance sdPoint(Point p, Point a) {
+    RichDistance rd;
+    rd.d = length(sub(p, a));
+    rd.rgba[0] = a.rgba[0];
+    rd.rgba[1] = a.rgba[1];
+    rd.rgba[2] = a.rgba[2];
+    rd.rgba[3] = a.rgba[3];
+    return rd;
+}
+
+RichDistance sdSegment(Point p, Point a, Point b ) {
+    RichDistance rd;
     Point pa = sub(p, a);
     Point ba = sub(b, a);
     float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0);
-    return length(sub(pa, mul(ba, h)));
+    rd.d = length(sub(pa, mul(ba, h)));
+    rd.rgba[0] = a.rgba[0]*(1-h) + b.rgba[0]*h;
+    rd.rgba[1] = a.rgba[1]*(1-h) + b.rgba[1]*h;
+    rd.rgba[2] = a.rgba[2]*(1-h) + b.rgba[2]*h;
+    rd.rgba[3] = a.rgba[3]*(1-h) + b.rgba[3]*h;
+    return rd;
 }
 
-void sdRenderLayer(Layer layer, float x, float y, unsigned char pixel[3]) {
-    float d = CANVAS_HEIGHT*CANVAS_WIDTH;
+void sdRenderLayer(Layer layer, float x, float y, float pixel[4]) {
+    RichDistance d = {CANVAS_HEIGHT*CANVAS_WIDTH, {0, 0, 0, 0}};
     Point p = {x, y};
     for (size_t i = 0; i < layer.size; i++) {
-        float gd = 0;
-        float* rgba = NULL;
+        RichDistance gd;
         switch (layer.geoms[i].type)
         {
         case POINT:
             gd = opRound(sdPoint(p, layer.geoms[i].point), layer.geoms[i].round_r);
-            rgba = layer.geoms[i].point.rgba;
             break;
         case SEGMENT:
             gd = opRound(sdSegment(p, layer.geoms[i].segment.a, layer.geoms[i].segment.b), layer.geoms[i].round_r);
-            rgba = layer.geoms[i].segment.a.rgba;
             break;
         default:
             break;
@@ -320,28 +371,31 @@ void sdRenderLayer(Layer layer, float x, float y, unsigned char pixel[3]) {
         switch (layer.fusion)
         {
         case F_MIN:
-            d = min(d, gd);
+            d = sdMin(d, gd);
             break;
         case F_SMIN:
-            d = smin(d, gd, 2);
+            d = sdMin(d, gd);
             break;
         default:
             break;
         }
-
-        float opacity = clamp(0.5-d, 0, 1);
-        if (opacity > 0) {
-            pixel[0] = (unsigned char) (rgba[2] * 255)*opacity;
-            pixel[1] = (unsigned char) (rgba[1] * 255)*opacity;
-            pixel[2] = (unsigned char) (rgba[0] * 255)*opacity;
-            break;
-        }
     }
+    float opacity = clamp(0.5-d.d, 0, 1);
+    pixel[0] = d.rgba[0];
+    pixel[1] = d.rgba[1];
+    pixel[2] = d.rgba[2];
+    pixel[3] = d.rgba[3]*opacity;
 }
 
 void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3]) {
-    for (size_t i = 0; i < scene->size; i++) {
-        sdRenderLayer(scene->layer[i], x, y, pixel);
+    for (int i = 0; i < scene->size; i++) {
+        float pixel4[4] = {0, 0, 0, 0};
+        sdRenderLayer(scene->layer[i], x, y, pixel4);
+        if (pixel4[3] > 0) {
+            pixel[0] = (unsigned char) (pixel4[2] * 255 * pixel4[3]);
+            pixel[1] = (unsigned char) (pixel4[1] * 255 * pixel4[3]);
+            pixel[2] = (unsigned char) (pixel4[0] * 255 * pixel4[3]);
+        }
     }
 }
 
