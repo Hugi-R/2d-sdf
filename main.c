@@ -1,7 +1,11 @@
 /*
     Render to BMP, using Signed Distance Function, instruction read from a file.
 
-    Instruction typically look like ROUND(SEGMENT(POINT(0.61 0.01768) POINT(0.06 0.03713)) 0.00386)
+    Instruction typically look like:
+        LAYER(1)
+        POINT(0.61 0.01768)
+        POINT(0.06 0.03713) 
+        ROUND(SEGMENT(0 1) 0.00386)
     Each line of the file contain one instruction.
 */
 
@@ -284,14 +288,7 @@ float dot(Point a, Point b) {
     return a.x*b.x + a.y*b.y;
 }
 
-// Smooth min using the root method
-float smin( float a, float b, float k ) {
-    k *= 2.0;
-    float x = b-a;
-    return 0.5*(a+b-sqrt(x*x+k*k));
-}
-
-// Smooth min using the quadratic method
+// Smooth min using the quadratic method. Return the distance and a color mixing value
 Point sminq( float a, float b, float k )
 {
     float h = 1.0 - min( abs(a-b)/(6.0*k), 1.0 );
@@ -304,6 +301,13 @@ Point sminq( float a, float b, float k )
 }
 
 RichDistance sdMin(RichDistance a, RichDistance b) {
+    if (a.d < b.d) {
+        return a;
+    }
+    return b;
+}
+
+RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
     Point sd = sminq(a.d, b.d, 1);
     RichDistance rd;
     rd.d = sd.x;
@@ -376,7 +380,7 @@ void sdRenderLayer(Layer layer, float x, float y, float pixel[4]) {
             d = sdMin(d, gd);
             break;
         case F_SMIN:
-            d = sdMin(d, gd);
+            d = sdSmoothMin(d, gd);
             break;
         default:
             break;
