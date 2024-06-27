@@ -31,8 +31,8 @@
 #define clamp(V, VMIN, VMAX) max(VMIN, min(VMAX, V))
 
 #define CANVAS_WIDTH 800
-#define CANVAS_HEIGHT 400
-#define MAX_GEOMS_PER_LAYER 100
+#define CANVAS_HEIGHT 800
+#define MAX_GEOMS_PER_LAYER 1000
 #define MAX_LAYER 100
 static float DIAG;
 
@@ -357,7 +357,7 @@ RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     return rd;
 }
 
-void sdRenderLayer(Layer layer, float x, float y, float pixel[4]) {
+void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distance) {
     RichDistance d = {CANVAS_HEIGHT*CANVAS_WIDTH, {0, 0, 0, 0}};
     Point p = {x, y};
     for (size_t i = 0; i < layer.size; i++) {
@@ -386,17 +386,18 @@ void sdRenderLayer(Layer layer, float x, float y, float pixel[4]) {
             break;
         }
     }
-    float opacity = clamp(0.5-d.d, 0, 1);
+    *distance = d.d;
+    float opacity = clamp(-d.d, 0, 1); // antialiasing, inside the Geom means 1, more than one pixel away means 0
     pixel[0] = d.rgba[0];
     pixel[1] = d.rgba[1];
     pixel[2] = d.rgba[2];
     pixel[3] = d.rgba[3]*opacity;
 }
 
-void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3]) {
+void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3], float *distance) {
     for (int i = 0; i < scene->size; i++) {
         float pixel4[4] = {0, 0, 0, 0};
-        sdRenderLayer(scene->layer[i], x, y, pixel4);
+        sdRenderLayer(scene->layer[i], x, y, pixel4, distance);
         if (pixel4[3] > 0) {
             pixel[0] = (unsigned char) (pixel4[2] * 255 * pixel4[3]);
             pixel[1] = (unsigned char) (pixel4[1] * 255 * pixel4[3]);
@@ -485,9 +486,17 @@ int write_bitmap(Scene* scene, char* imageFileName)
     fwrite(infoHeader, 1, INFO_HEADER_SIZE, imageFile);
 
     for (int y = 0; y < CANVAS_HEIGHT; y++) {
+        int next_pixel = 0;
+        float last_distance = 0;
         for (int x = 0; x < CANVAS_WIDTH; x++) {
             unsigned char pixel[] = {0, 0, 0};
-            sdRenderScene(scene, x, y, pixel);
+            if (x >= next_pixel) { // Simple optimization, since we know the distance to the next pixel
+                sdRenderScene(scene, x, y, pixel, &last_distance);
+                next_pixel = x + (int) last_distance;
+            } else {
+                // Uncomment to see the effect of the optimization. Red means pixels are skipped
+                // pixel[2] = (unsigned char) clamp(last_distance, 0, 255);
+            }
             fwrite(pixel, BYTES_PER_PIXEL, 1, imageFile);
         }
         fwrite(padding, 1, paddingSize, imageFile);
@@ -506,14 +515,14 @@ int main(void) {
     size_t len = 0;
     ssize_t read;
 
-    fp = fopen("data.wkt", "r");
+    fp = fopen("grid.wkt", "r");
     if (fp == NULL)
         exit(EXIT_FAILURE);
 
     int res = OK;
     while ((read = getline(&line, &len, fp)) != -1) {
         size_t cursor = 0;
-        line[--read] = '\0'; // Remove LF (will break on LFLR)
+        line[--read] = '\0'; // Remove LF (insufficient for Windows LFCR)
         if((res = parse_line(&scene, line, &cursor, read)) == OK) {
         } else {
             LOG_E("Got error %d for line: %s", res, line);
