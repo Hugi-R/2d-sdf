@@ -392,15 +392,25 @@ void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distanc
 }
 
 void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3], float *distance) {
+    *distance = CANVAS_HEIGHT*CANVAS_WIDTH;
+    float avgPixel[3] = {0, 0, 0};
+    float pixels4[MAX_LAYER][4];
     for (int i = 0; i < scene->size; i++) {
-        float pixel4[4] = {0, 0, 0, 0};
-        sdRenderLayer(scene->layer[i], x, y, pixel4, distance);
-        if (pixel4[3] > 0) {
-            pixel[0] = (unsigned char) (pixel4[2] * 255 * pixel4[3]);
-            pixel[1] = (unsigned char) (pixel4[1] * 255 * pixel4[3]);
-            pixel[2] = (unsigned char) (pixel4[0] * 255 * pixel4[3]);
-        }
+        float d;
+        sdRenderLayer(scene->layer[i], x, y, pixels4[i], &d);
+        *distance = min(*distance, d);
     }
+    for (int i = 0; i < scene->size; i++) {
+        avgPixel[0] += pixels4[i][0]*pixels4[i][3];
+        avgPixel[1] += pixels4[i][1]*pixels4[i][3];
+        avgPixel[2] += pixels4[i][2]*pixels4[i][3];
+    }
+    avgPixel[0] = clamp(avgPixel[0], 0, 1);
+    avgPixel[1] = clamp(avgPixel[1], 0, 1);
+    avgPixel[2] = clamp(avgPixel[2], 0, 1);
+    pixel[0] = (unsigned char) (avgPixel[2] * 255);
+    pixel[1] = (unsigned char) (avgPixel[1] * 255);
+    pixel[2] = (unsigned char) (avgPixel[0] * 255);
 }
 
 /* === */
