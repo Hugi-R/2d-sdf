@@ -23,17 +23,29 @@
 #define E_PARSE_ISEGMENT_BAD_INDEX -12
 #define E_PARSE_NEED_LAYER -13
 #define E_RENDER_INVALID_COORD -30
+#define E_FILE_OPEN -40
 
 #define LOG_E(FORMAT, ...) fprintf(stderr, "%s:%d ERROR: " FORMAT "\n", __FILE__, __LINE__, __VA_ARGS__);
 #define END_IF_NOK(X) if ((res = X) != OK) {return res;}
+
+/* Math macro, inspired by GLSL function */
+// Min
 #define min(X, Y) ((X) < (Y) ? (X) : (Y))
+// Max
 #define max(X, Y) ((X) > (Y) ? (X) : (Y))
+// Clamp value V between VMIN and VMAX
 #define clamp(V, VMIN, VMAX) max(VMIN, min(VMAX, V))
+// Get the value at A (0 to 1) for linear interpolation from X to Y
+#define mix(X, Y, A) (X*(1-A) + Y*A)
+// Mix, for an array of size 4. R is the result array, X and Y are being mixed, A is the scalar position of the interpolation
+#define mix4(R, X, Y, A) R[0] = mix(X[0], Y[0], A); R[1] = mix(X[1], Y[1], A); R[2] = mix(X[2], Y[2], A); R[3] = mix(X[3], Y[3], A);
+// Copy an array[4] B into A
+#define copy4(A, B) A[0] = B[0]; A[1] = B[1]; A[2] = B[2]; A[3] = B[3];
 
 #define CANVAS_WIDTH 800
 #define CANVAS_HEIGHT 800
-#define MAX_GEOMS_PER_LAYER 1000
-#define MAX_LAYER 100
+#define MAX_GEOMS_PER_LAYER 500
+#define MAX_LAYER 5
 static float DIAG;
 
 // Geom types
@@ -270,10 +282,6 @@ float length(Point p) {
     return sqrt(p.x*p.x + p.y*p.y);
 }
 
-float mix(float x, float y, float a) {
-    return x*(1-a) + y*a;
-}
-
 Point sub(Point a, Point b) {
     Point c = {a.x - b.x, a.y - b.y};
     return c;
@@ -311,10 +319,7 @@ RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
     Point sd = sminq(a.d, b.d, 1);
     RichDistance rd;
     rd.d = sd.x;
-    rd.rgba[0] = mix(a.rgba[0], b.rgba[0], sd.y);
-    rd.rgba[1] = mix(a.rgba[1], b.rgba[1], sd.y);
-    rd.rgba[2] = mix(a.rgba[2], b.rgba[2], sd.y);
-    rd.rgba[3] = mix(a.rgba[3], b.rgba[3], sd.y);
+    mix4(rd.rgba, a.rgba, b.rgba, sd.y);
     return rd;
 }
 
@@ -326,10 +331,7 @@ RichDistance opRound(RichDistance rd, float r) {
 RichDistance sdPoint(Point p, Point a) {
     RichDistance rd;
     rd.d = length(sub(p, a));
-    rd.rgba[0] = a.rgba[0];
-    rd.rgba[1] = a.rgba[1];
-    rd.rgba[2] = a.rgba[2];
-    rd.rgba[3] = a.rgba[3];
+    copy4(rd.rgba, a.rgba);
     return rd;
 }
 
@@ -349,10 +351,7 @@ RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     float ar = ag->round_r / dab; // Where the color gradiant start for A, on segment AB
     float br = bg->round_r / dab; // Where the color gradiant start for B, on segment BA
     float ch = clamp(h-ar, 0, (1-(ar+br))) / (1 - (ar+br)); // h for color, ar become the 0 of ch, and br become the 1
-    rd.rgba[0] = a.rgba[0]*(1-ch) + b.rgba[0]*ch;
-    rd.rgba[1] = a.rgba[1]*(1-ch) + b.rgba[1]*ch;
-    rd.rgba[2] = a.rgba[2]*(1-ch) + b.rgba[2]*ch;
-    rd.rgba[3] = a.rgba[3]*(1-ch) + b.rgba[3]*ch;
+    mix4(rd.rgba, a.rgba, b.rgba, ch);
     
     return rd;
 }
@@ -388,10 +387,8 @@ void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distanc
     }
     *distance = d.d;
     float opacity = clamp(-d.d, 0, 1); // antialiasing, inside the Geom means 1, more than one pixel away means 0
-    pixel[0] = d.rgba[0];
-    pixel[1] = d.rgba[1];
-    pixel[2] = d.rgba[2];
-    pixel[3] = d.rgba[3]*opacity;
+    copy4(pixel, d.rgba);
+    pixel[3] *= opacity;
 }
 
 void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3], float *distance) {
@@ -478,6 +475,10 @@ int write_bitmap(Scene* scene, char* imageFileName)
     int stride = (widthInBytes) + paddingSize;
 
     FILE* imageFile = fopen(imageFileName, "wb");
+    if (imageFile == NULL) {
+        LOG_E("Failed to open output file %s", imageFileName);
+        return E_FILE_OPEN;
+    }
 
     unsigned char* fileHeader = create_bitmap_file_header(CANVAS_HEIGHT, stride);
     fwrite(fileHeader, 1, FILE_HEADER_SIZE, imageFile);
@@ -505,34 +506,49 @@ int write_bitmap(Scene* scene, char* imageFileName)
     fclose(imageFile);
 }
 
-int main(void) {
-    DIAG = sqrt(CANVAS_WIDTH*CANVAS_WIDTH + CANVAS_HEIGHT*CANVAS_HEIGHT);
+int render_file(char* input, char* output) {
+    int res = OK;
+
     Scene scene;
     scene.size = 0;
 
-    FILE* fp;
     char* line = NULL;
     size_t len = 0;
     ssize_t read;
 
-    fp = fopen("grid.wkt", "r");
-    if (fp == NULL)
-        exit(EXIT_FAILURE);
+    FILE* fp = fopen(input, "r");
+    if (fp == NULL) {
+        LOG_E("Failed to open input file %s", input);
+        return E_FILE_OPEN;
+    }
 
-    int res = OK;
     while ((read = getline(&line, &len, fp)) != -1) {
         size_t cursor = 0;
         line[--read] = '\0'; // Remove LF (insufficient for Windows LFCR)
-        if((res = parse_line(&scene, line, &cursor, read)) == OK) {
-        } else {
+        if(parse_line(&scene, line, &cursor, read) != OK) {
             LOG_E("Got error %d for line: %s", res, line);
         }
     }
 
-    write_bitmap(&scene, "canvas.bmp");
-
     fclose(fp);
-    if (line)
+    if (line) {
         free(line);
+    }
+
+    res = write_bitmap(&scene, "canvas.bmp");
+
+    return res;
+}
+
+int main(int argc, char* argv[]) {
+    DIAG = sqrt(CANVAS_WIDTH*CANVAS_WIDTH + CANVAS_HEIGHT*CANVAS_HEIGHT);
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <inputFile>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    render_file(argv[1], "canvas.bmp");
+
     exit(EXIT_SUCCESS);
 }
