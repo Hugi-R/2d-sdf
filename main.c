@@ -1,4 +1,7 @@
 /*
+    Author: Hugo Roussel, unless indicated otherwise.
+    License: MIT, with parts in CC BY-SA 4.0.
+
     Render to BMP, using Signed Distance Function, instruction read from a file.
 
     Instruction typically look like:
