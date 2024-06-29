@@ -48,7 +48,22 @@
 #define CANVAS_HEIGHT 800
 #define MAX_GEOMS_PER_LAYER 500
 #define MAX_LAYER 5
-#define BEZIER_LUT_SIZE 21
+#define BEZIER_LUT_SIZE 31
+#define MAX_BEZIER_POINT 11
+// Binomial coeficient for n=MAX_BEZIER_POINT-1, because coeficient are calculated on [0,n] but C index is [0,n[ 
+const float binom_coef[MAX_BEZIER_POINT][MAX_BEZIER_POINT] = {
+    {1, 0,  0,  0,   0,   0,   0,   0,   0,  0,  0},
+    {1, 1,  0,  0,   0,   0,   0,   0,   0,  0,  0},
+    {1, 2,  1,  0,   0,   0,   0,   0,   0,  0,  0},
+    {1, 3,  3,  1,   0,   0,   0,   0,   0,  0,  0},
+    {1, 4,  6,  4,   1,   0,   0,   0,   0,  0,  0},
+    {1, 5,  10, 10,  5,   1,   0,   0,   0,  0,  0},
+    {1, 6,  15, 20,  15,  6,   1,   0,   0,  0,  0},
+    {1, 7,  21, 35,  35,  21,  7,   1,   0,  0,  0},
+    {1, 8,  28, 56,  70,  56,  28,  8,   1,  0,  0},
+    {1, 9,  36, 84,  126, 126, 84,  36,  9,  1,  0},
+    {1, 10, 45, 120, 210, 252, 210, 120, 45, 10, 1}
+};
 static float DIAG;
 
 // Geom types
@@ -74,8 +89,7 @@ typedef struct Vec2 {
 } Vec2;
 
 struct Point {
-    float x;
-    float y;
+    Vec2 v;
     float rgba[4];
 };
 
@@ -85,9 +99,8 @@ struct Segment {
 };
 
 struct Bezier {
-    Geom* a;
-    Geom* b;
-    Geom* c;
+    Geom* points[MAX_BEZIER_POINT];
+    size_t size;
     Vec2 lut[BEZIER_LUT_SIZE]; // TODO: this is expensive as the lut exist even for non bezier geom
 };
 
@@ -117,7 +130,8 @@ struct RichDistance {
 
 // function Definitions
 int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size);
-Vec2 quadraticBezier(float t, Vec2 A, Vec2 B, Vec2 C);
+// Vec2 quadraticBezier(float t, Vec2 A, Vec2 B, Vec2 C);
+Vec2 bezier(float t, Bezier* B);
 // ===
 
 int parse_number(char* str, size_t* cursor, size_t stop, float* number) {
@@ -174,9 +188,9 @@ int parse_color(char* line, size_t* cursor, size_t line_size, Point* point) {
 int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
     int res = OK;
     *cursor += 6; // Skip POINT(
-    END_IF_NOK(parse_number(line, cursor, line_size, &(point->x)))
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->v.x)))
     *cursor += 1; // Skip the separator space
-    END_IF_NOK(parse_number(line, cursor, line_size, &(point->y)))
+    END_IF_NOK(parse_number(line, cursor, line_size, &(point->v.y)))
     *cursor += 1; // Skip the separator space
     if (line[*cursor] == 'C') {
         END_IF_NOK(parse_color(line, cursor, line_size, point))
@@ -187,8 +201,8 @@ int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
         point->rgba[3] = 1;
     }
     *cursor += 1; // Skip the )
-    point->x *= CANVAS_WIDTH;
-    point->y *= CANVAS_HEIGHT;
+    point->v.x *= CANVAS_WIDTH;
+    point->v.y *= CANVAS_HEIGHT;
 
     return res;
 }
@@ -224,40 +238,24 @@ int parse_segment(Layer* layer, char* line, size_t* cursor, size_t line_size, Se
 // Where N is the index of a Point Geom in the Layer
 int parse_bezier(Layer* layer, char* line, size_t* cursor, size_t line_size, Bezier* bez) {
     int res = OK;
-    int ia, ib, ic;
+    bez->size = 0;
+
     *cursor += 7; // Skip BEZIER(
-    END_IF_NOK(parse_int(line, cursor, line_size, &ia))
-    *cursor += 1; // Skip the separator space
-    END_IF_NOK(parse_int(line, cursor, line_size, &ib))
-    *cursor += 1; // Skip the separator space
-    END_IF_NOK(parse_int(line, cursor, line_size, &ic))
-    *cursor += 1; // Skip the )
-
-    if (ia >= 0 && ia < layer->size && layer->geoms[ia].type == POINT) {
-        bez->a = &(layer->geoms[ia]);
-    } else {
-        LOG_E("Bad Point Geom index %d", ia);
-        return E_PARSE_ISEGMENT_BAD_INDEX;
-    }
-    if (ib >= 0 && ib < layer->size && layer->geoms[ib].type == POINT) {
-        bez->b = &(layer->geoms[ib]);
-    } else {
-        LOG_E("Bad Point Geom index %d", ib);
-        return E_PARSE_ISEGMENT_BAD_INDEX;
-    }
-    if (ic >= 0 && ic < layer->size && layer->geoms[ic].type == POINT) {
-        bez->c = &(layer->geoms[ic]);
-    } else {
-        LOG_E("Bad Point Geom index %d", ic);
-        return E_PARSE_ISEGMENT_BAD_INDEX;
+    for(int i = 0; (i < MAX_BEZIER_POINT) && (*cursor < line_size) && (line[*cursor - 1] != ')'); i++) {
+        int index;
+        END_IF_NOK(parse_int(line, cursor, line_size, &index))
+        *cursor += 1; // Skip the separator space (or other next char)
+        if (index >= 0 && index < layer->size && layer->geoms[index].type == POINT) {
+            bez->points[i] = &(layer->geoms[index]);
+            bez->size++;
+        } else {
+            LOG_E("Bad Point Geom index %d", index);
+            return E_PARSE_ISEGMENT_BAD_INDEX;
+        }
     }
 
-    Vec2 vA = {bez->a->point.x, bez->a->point.y};
-    Vec2 vB = {bez->b->point.x, bez->b->point.y};
-    Vec2 vC = {bez->c->point.x, bez->c->point.y};
     for (int i = 0; i < BEZIER_LUT_SIZE; i++) {
-        LOG_E("%d %f", i, ((float)i)/(BEZIER_LUT_SIZE-1));
-        bez->lut[i] = quadraticBezier(((float)i)/(BEZIER_LUT_SIZE-1), vA, vB, vC);
+        bez->lut[i] = bezier(((float)i)/(BEZIER_LUT_SIZE-1), bez);
     }
 
     return res;
@@ -348,24 +346,8 @@ float sign(float s) {
     return (s > 0.0) - (s < 0.0);
 }
 
-float length(Point p) {
-    return sqrtf(p.x*p.x + p.y*p.y);
-}
-
 float length2(Vec2 p) {
     return sqrtf(p.x*p.x + p.y*p.y);
-}
-
-Point sub(Point a, Point b) {
-    return (Point){a.x - b.x, a.y - b.y};
-}
-
-Point add(Point a, Point b) {
-    return (Point){a.x + b.x, a.y + b.y};
-}
-
-Point mul(Point a, float s) {
-    return (Point){a.x * s, a.y * s};
 }
 
 Vec2 add2(Vec2 a, Vec2 b) {
@@ -388,19 +370,15 @@ float cro2( Vec2 a, Vec2 b ) {
     return a.x*b.y - a.y*b.x;
 }
 
-float dot(Point a, Point b) {
-    return a.x*b.x + a.y*b.y;
-}
-
 // Smooth min using the quadratic method. Return the distance and a color mixing value
-Point sminq( float a, float b, float k )
+Vec2 sminq( float a, float b, float k )
 {
     float h = 1.0 - min( fabsf(a-b)/(6.0*k), 1.0 );
     float w = h*h*h;
     float m = w*0.5;
     float s = w*k;
-    Point ra = {a-s,m};
-    Point rb = {b-s,1.0-m};
+    Vec2 ra = {a-s,m};
+    Vec2 rb = {b-s,1.0-m};
     return (a<b) ? ra : rb;
 }
 
@@ -412,7 +390,7 @@ RichDistance sdMin(RichDistance a, RichDistance b) {
 }
 
 RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
-    Point sd = sminq(a.d, b.d, 1);
+    Vec2 sd = sminq(a.d, b.d, 1);
     RichDistance rd;
     rd.d = sd.x;
     mix4(rd.rgba, a.rgba, b.rgba, sd.y);
@@ -426,7 +404,7 @@ RichDistance opRound(RichDistance rd, float r) {
 
 RichDistance sdPoint(Point p, Point a) {
     RichDistance rd;
-    rd.d = length(sub(p, a));
+    rd.d = length2(sub2(p.v, a.v));
     copy4(rd.rgba, a.rgba);
     return rd;
 }
@@ -434,39 +412,40 @@ RichDistance sdPoint(Point p, Point a) {
 // Exact SDF for segment, from https://iquilezles.org/articles/distfunctions2d/
 RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     RichDistance rd;
-    Point a = ag->point;
-    Point b = bg->point;
+    Vec2 a = ag->point.v;
+    Vec2 b = bg->point.v;
     // Calculate distance
-    Point pa = sub(p, a);
-    Point ba = sub(b, a);
-    float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0); // h is the projection of the Point p on segment AB, with value 0 for A, and 1 for B
-    rd.d = length(sub(pa, mul(ba, h)));
+    Vec2 pa = sub2(p.v, a);
+    Vec2 ba = sub2(b, a);
+    float h = clamp(dot2(pa,ba)/dot2(ba,ba), 0.0, 1.0); // h is the projection of the Point p on segment AB, with value 0 for A, and 1 for B
+    rd.d = length2(sub2(pa, mul2(ba, h)));
 
     // Calculate color gradiant.
     // We want the gradiant to start from the edge of the circle, which add some complexity
-    float dab = length(sub(b, a));
+    float dab = length2(sub2(b, a));
     float ar = ag->round_r / dab; // Where the color gradiant start for A, on segment AB
     float br = bg->round_r / dab; // Where the color gradiant start for B, on segment BA
     float ch = clamp(h-ar, 0.0, (1-(ar+br))) / (1 - (ar+br)); // h for color, ar become the 0 of ch, and br become the 1
-    mix4(rd.rgba, a.rgba, b.rgba, ch);
+    mix4(rd.rgba, ag->point.rgba, bg->point.rgba, ch);
     
     return rd;
 }
 
-Vec2 quadraticBezier(float t, Vec2 A, Vec2 B, Vec2 C) {
-    return add2(add2(B, mul2(sub2(A, B), (1.0-t)*(1.0-t))), mul2(sub2(C, B), t*t));
+Vec2 bezier(float t, Bezier* B) {
+    Vec2 res = {0, 0};
+    const int n = B->size-1;
+    for (int i = 0; i < B->size; i++) {
+        res = add2(res, mul2(B->points[i]->point.v, binom_coef[n][i]*powf(1.0-t, n-i)*powf(t, i)));
+    }
+    return res;
 }
 
 RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
-    Vec2 vA = {bez->a->point.x, bez->a->point.y};
-    Vec2 vB = {bez->b->point.x, bez->b->point.y};
-    Vec2 vC = {bez->c->point.x, bez->c->point.y};
-    Vec2 vPos = {pos.x, pos.y};
     float d = CANVAS_HEIGHT*CANVAS_WIDTH;
 
     int min_i = 0;
     for (int i = 0; i < BEZIER_LUT_SIZE; i++) {
-        float temp_d = length2(sub2(bez->lut[i], vPos));
+        float temp_d = length2(sub2(bez->lut[i], pos.v));
         if (temp_d < d) {
             min_i = i;
             d = temp_d;
@@ -480,8 +459,8 @@ RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
     float dist[5];
     for (int i = 0; i < 5; i++) {
         t[i] = ((float)(min_i+(i-2)))/(BEZIER_LUT_SIZE-1);
-        bezier_point[i] = quadraticBezier(t[i], vA, vB, vC);
-        dist[i] = length2(sub2(vPos, bezier_point[i]));
+        bezier_point[i] = bezier(t[i], bez);
+        dist[i] = length2(sub2(pos.v, bezier_point[i]));
     }
     while ((t[4] - t[0]) > 1e-4) {
         int min_i = 0;
@@ -506,15 +485,15 @@ RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
         
         t[1] = (t[0] + t[2])/2.0;
         t[3] = (t[2] + t[4])/2.0;
-        bezier_point[1] = quadraticBezier(t[1], vA, vB, vC);
-        bezier_point[3] = quadraticBezier(t[3], vA, vB, vC);
-        dist[1] = length2(sub2(vPos, bezier_point[1]));
-        dist[3] = length2(sub2(vPos, bezier_point[3]));
+        bezier_point[1] = bezier(t[1], bez);
+        bezier_point[3] = bezier(t[3], bez);
+        dist[1] = length2(sub2(pos.v, bezier_point[1]));
+        dist[3] = length2(sub2(pos.v, bezier_point[3]));
     }
     
     RichDistance rd;
     rd.d = d;
-    copy4(rd.rgba, bez->a->point.rgba);
+    copy4(rd.rgba, bez->points[0]->point.rgba);
     return rd;
 }
 
@@ -699,7 +678,7 @@ int render_file(char* input, char* output) {
 
     while ((read = getline(&line, &len, fp)) != -1) {
         size_t cursor = 0;
-        line[--read] = '\0'; // Remove LF (insufficient for Windows LFCR)
+        if (line[read-1] == '\n') {line[--read] = '\0';} // Remove LF (insufficient for Windows LFCR)
         if(parse_line(&scene, line, &cursor, read) != OK) {
             LOG_E("Got error %d for line: %s", res, line);
         }
