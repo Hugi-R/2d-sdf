@@ -52,21 +52,8 @@
 #define MAX_LAYER 5
 #define BEZIER_LUT_SIZE 31
 #define MAX_BEZIER_POINT 11
-
-// Precompted binomial coeficient for n=MAX_BEZIER_POINT-1, because coeficient are calculated on [0,n] but C index is [0,n[ 
-const float binom_coef[MAX_BEZIER_POINT][MAX_BEZIER_POINT] = {
-    {1, 0,  0,  0,   0,   0,   0,   0,   0,  0,  0},
-    {1, 1,  0,  0,   0,   0,   0,   0,   0,  0,  0},
-    {1, 2,  1,  0,   0,   0,   0,   0,   0,  0,  0},
-    {1, 3,  3,  1,   0,   0,   0,   0,   0,  0,  0},
-    {1, 4,  6,  4,   1,   0,   0,   0,   0,  0,  0},
-    {1, 5,  10, 10,  5,   1,   0,   0,   0,  0,  0},
-    {1, 6,  15, 20,  15,  6,   1,   0,   0,  0,  0},
-    {1, 7,  21, 35,  35,  21,  7,   1,   0,  0,  0},
-    {1, 8,  28, 56,  70,  56,  28,  8,   1,  0,  0},
-    {1, 9,  36, 84,  126, 126, 84,  36,  9,  1,  0},
-    {1, 10, 45, 120, 210, 252, 210, 120, 45, 10, 1}
-};
+#define BEZIER_MAX_ITERATIONS 10
+#define BEZIER_EPSILON 1e-6
 
 // Global rendering parameters set at runtime
 static int _canvas_width = 0;
@@ -354,10 +341,6 @@ static inline float sign(float s) {
     return (s > 0.0) - (s < 0.0);
 }
 
-static inline float length2(Vec2 p) {
-    return sqrtf(p.x*p.x + p.y*p.y);
-}
-
 static inline Vec2 add2(Vec2 a, Vec2 b) {
     return (Vec2){a.x + b.x, a.y + b.y};
 }
@@ -376,6 +359,26 @@ static inline float dot2(Vec2 a, Vec2 b) {
 
 static inline float cro2( Vec2 a, Vec2 b ) { 
     return a.x*b.y - a.y*b.x;
+}
+
+static inline float length2(Vec2 p) {
+    return sqrtf(p.x*p.x + p.y*p.y);
+}
+
+static inline float distance2(Vec2 a, Vec2 b) {
+    return length2(sub2(a, b));
+}
+
+static float squaredDistance2(Vec2 a, Vec2 b) {
+    Vec2 diff = sub2(a, b);
+    return dot2(diff, diff);
+}
+
+static inline Vec2 lerp2(Vec2 a, Vec2 b, float t) {
+    Vec2 result;
+    result.x = (1-t) * a.x + t * b.x;
+    result.y = (1-t) * a.y + t * b.y;
+    return result;
 }
 
 // Smooth min using the quadratic method. Return the distance and a color mixing value
@@ -436,65 +439,87 @@ static RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     return rd;
 }
 
+// Bezier using De Casteljau's algorithm
 static Vec2 bezier(float t, Bezier* B) {
-    Vec2 res = {0, 0};
-    const int n = B->size-1;
-    for (int i = 0; i < B->size; i++) {
-        res = add2(res, mul2(B->points[i]->point.v, binom_coef[n][i]*powf(1.0-t, n-i)*powf(t, i)));
+    Vec2 temp[MAX_BEZIER_POINT];
+    
+    // Copy initial points
+    for (size_t i = 0; i < B->size; i++) {
+        temp[i] = B->points[i]->point.v;
     }
-    return res;
+    
+    // De Casteljau's algorithm
+    for (size_t r = 1; r < B->size; r++) {
+        for (size_t i = 0; i < B->size - r; i++) {
+            // temp[i] = add2(mul2(temp[i], 1.0f - t), mul2(temp[i + 1], t));
+            temp[i] = lerp2(temp[i], temp[i+1], t);
+        }
+    }
+    
+    return temp[0];
+}
+
+// Derivative of the Bezier curve
+static Vec2 bezier_derivative(float t, Bezier* B) {
+    Vec2 temp[MAX_BEZIER_POINT - 1];
+    
+    for (size_t i = 0; i < B->size - 1; i++) {
+        temp[i].x = B->size * (B->points[i+1]->point.v.x - B->points[i]->point.v.x);
+        temp[i].y = B->size * (B->points[i+1]->point.v.y - B->points[i]->point.v.y);
+    }
+    
+    for (size_t r = 1; r < B->size - 1; r++) {
+        for (size_t i = 0; i < B->size - r - 1; i++) {
+            temp[i] = lerp2(temp[i], temp[i+1], t);
+        }
+    }
+    
+    return temp[0];
 }
 
 static RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
-    float d = FLT_MAX;
+    float min_distance_sq = FLT_MAX;
 
+    // Initial subdivision to find a good starting point
     int min_i = 0;
     for (int i = 0; i < BEZIER_LUT_SIZE; i++) {
-        float temp_d = length2(sub2(bez->lut[i], pos.v));
-        if (temp_d < d) {
-            min_i = i;
-            d = temp_d;
-        }
-    }
-    if (min_i == 0) {min_i += 2;}
-    if (min_i == BEZIER_LUT_SIZE-1) {min_i -= 2;}
-
-    float t[5];
-    Vec2 bezier_point[5];
-    float dist[5];
-    for (int i = 0; i < 5; i++) {
-        t[i] = ((float)(min_i+(i-2)))/(BEZIER_LUT_SIZE-1);
-        bezier_point[i] = bezier(t[i], bez);
-        dist[i] = length2(sub2(pos.v, bezier_point[i]));
-    }
-    while ((t[4] - t[0]) > 1e-4) {
-        int min_i = 0;
-        d = dist[0];
-        for (int i = 1; i < 5; i++) {
-            if (dist[i] < d) {
-                d = dist[i];
-                min_i = i;
-            }
-        }
-        if (min_i == 0) {min_i = 1;}
-        if (min_i == 4) {min_i = 3;}
-        t[0] = t[min_i-1];
-        t[4] = t[min_i+1];
-        t[2] = t[min_i];
-        bezier_point[0] = bezier_point[min_i-1];
-        bezier_point[4] = bezier_point[min_i+1];
-        bezier_point[2] = bezier_point[min_i];
-        dist[0] = dist[min_i-1];
-        dist[4] = dist[min_i+1];
-        dist[2] = dist[min_i];
+        float distance_sq = squaredDistance2(bez->lut[i], pos.v);
         
-        t[1] = (t[0] + t[2])/2.0;
-        t[3] = (t[2] + t[4])/2.0;
-        bezier_point[1] = bezier(t[1], bez);
-        bezier_point[3] = bezier(t[3], bez);
-        dist[1] = length2(sub2(pos.v, bezier_point[1]));
-        dist[3] = length2(sub2(pos.v, bezier_point[3]));
+        if (distance_sq < min_distance_sq) {
+            min_distance_sq = distance_sq;
+            min_i = i;
+        }
     }
+    float min_t = ((float)min_i)/(BEZIER_LUT_SIZE-1);
+
+    // Refine using Newton's method
+    for (int i = 0; i < BEZIER_MAX_ITERATIONS; i++) {
+        Vec2 point = bezier(min_t, bez);
+        Vec2 derivative = bezier_derivative(min_t, bez);
+        Vec2 diff = sub2(point, pos.v);
+        
+        float numerator = dot2(diff, derivative);
+        float denominator = dot2(derivative, derivative);
+        
+        if (fabsf(numerator) < BEZIER_EPSILON * denominator) {
+            break;  // We've converged
+        }
+        
+        float t_new = min_t - numerator / denominator;
+        
+        if (t_new < 0.0f) {
+            min_t = 0.0f;
+            break;
+        } else if (t_new > 1.0f) {
+            min_t = 1.0f;
+            break;
+        }
+        
+        min_t = t_new;
+    }
+
+    Vec2 closest_point = bezier(min_t, bez);
+    float d = distance2(closest_point, pos.v);
     
     RichDistance rd;
     rd.d = d;
