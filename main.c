@@ -19,6 +19,7 @@
 #include "sys/types.h"
 #include "string.h"
 #include "math.h"
+#include "float.h" // FLT_MAX
 
 // Return codes
 #define OK 0
@@ -47,13 +48,12 @@
 // Copy an array[4] B into A
 #define copy4(A, B) A[0] = B[0]; A[1] = B[1]; A[2] = B[2]; A[3] = B[3];
 
-#define CANVAS_WIDTH 800
-#define CANVAS_HEIGHT 800
 #define MAX_GEOMS_PER_LAYER 500
 #define MAX_LAYER 5
 #define BEZIER_LUT_SIZE 31
 #define MAX_BEZIER_POINT 11
-// Binomial coeficient for n=MAX_BEZIER_POINT-1, because coeficient are calculated on [0,n] but C index is [0,n[ 
+
+// Precompted binomial coeficient for n=MAX_BEZIER_POINT-1, because coeficient are calculated on [0,n] but C index is [0,n[ 
 const float binom_coef[MAX_BEZIER_POINT][MAX_BEZIER_POINT] = {
     {1, 0,  0,  0,   0,   0,   0,   0,   0,  0,  0},
     {1, 1,  0,  0,   0,   0,   0,   0,   0,  0,  0},
@@ -67,7 +67,11 @@ const float binom_coef[MAX_BEZIER_POINT][MAX_BEZIER_POINT] = {
     {1, 9,  36, 84,  126, 126, 84,  36,  9,  1,  0},
     {1, 10, 45, 120, 210, 252, 210, 120, 45, 10, 1}
 };
-static float DIAG;
+
+// Global rendering parameters set at runtime
+static int _canvas_width = 0;
+static int _canvas_height = 0;
+static float _diag = 0;
 
 // Geom types
 #define POINT 0
@@ -130,14 +134,15 @@ struct RichDistance {
     float d;
     float rgba[4];
 };
+#define DEFAULT_RD (RichDistance){FLT_MAX, {0, 0, 0, 0}}
 
 // function Definitions
-int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size);
+static int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size);
 // Vec2 quadraticBezier(float t, Vec2 A, Vec2 B, Vec2 C);
-Vec2 bezier(float t, Bezier* B);
+static Vec2 bezier(float t, Bezier* B);
 // ===
 
-int parse_number(char* str, size_t* cursor, size_t stop, float* number) {
+static int parse_number(char* str, size_t* cursor, size_t stop, float* number) {
     char num[32];
     if (*cursor > stop) {
         LOG_E("Failed to read number, cursor value %ld is above stop %ld", *cursor, stop);
@@ -157,7 +162,7 @@ int parse_number(char* str, size_t* cursor, size_t stop, float* number) {
     return OK;
 }
 
-int parse_int(char* str, size_t* cursor, size_t stop, int* number) {
+static int parse_int(char* str, size_t* cursor, size_t stop, int* number) {
     int res = OK;
     float x = 0;
     END_IF_NOK(parse_number(str, cursor, stop, &x))
@@ -171,7 +176,7 @@ int parse_int(char* str, size_t* cursor, size_t stop, int* number) {
 }
 
 // Parse COLOR(N N N N)
-int parse_color(char* line, size_t* cursor, size_t line_size, Point* point) {
+static int parse_color(char* line, size_t* cursor, size_t line_size, Point* point) {
     int res = OK;
     *cursor += 6; // Skip COLOR(
     END_IF_NOK(parse_number(line, cursor, line_size, &(point->rgba[0])))
@@ -188,7 +193,7 @@ int parse_color(char* line, size_t* cursor, size_t line_size, Point* point) {
 
 // Parse POINT(N N COLOR(...))
 // COLOR(...) is optional
-int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
+static int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
     int res = OK;
     *cursor += 6; // Skip POINT(
     END_IF_NOK(parse_number(line, cursor, line_size, &(point->v.x)))
@@ -204,15 +209,15 @@ int parse_point(char* line, size_t* cursor, size_t line_size, Point* point) {
         point->rgba[3] = 1;
     }
     *cursor += 1; // Skip the )
-    point->v.x *= CANVAS_WIDTH;
-    point->v.y *= CANVAS_HEIGHT;
+    point->v.x *= _canvas_width;
+    point->v.y *= _canvas_height;
 
     return res;
 }
 
 // Parse SEGMENT(N N)
 // Where N is the index of a Point Geom in the Layer
-int parse_segment(Layer* layer, char* line, size_t* cursor, size_t line_size, Segment* seg) {
+static int parse_segment(Layer* layer, char* line, size_t* cursor, size_t line_size, Segment* seg) {
     int res = OK;
     int ia, ib;
     *cursor += 8; // Skip SEGMENT(
@@ -239,7 +244,7 @@ int parse_segment(Layer* layer, char* line, size_t* cursor, size_t line_size, Se
 
 // Parse BEZIER(N N)
 // Where N is the index of a Point Geom in the Layer
-int parse_bezier(Layer* layer, char* line, size_t* cursor, size_t line_size, Bezier* bez) {
+static int parse_bezier(Layer* layer, char* line, size_t* cursor, size_t line_size, Bezier* bez) {
     int res = OK;
     bez->size = 0;
 
@@ -265,21 +270,21 @@ int parse_bezier(Layer* layer, char* line, size_t* cursor, size_t line_size, Bez
 }
 
 // Parse ROUND(N ...)
-int parse_round(Scene* scene, char* line, size_t* cursor, size_t line_size, Geom* geom) {
+static int parse_round(Scene* scene, char* line, size_t* cursor, size_t line_size, Geom* geom) {
     int res = OK;
     *cursor += 6; // Skip ROUND(
     END_IF_NOK(parse_number(line, cursor, line_size, &(geom->round_r)))
     *cursor += 1; // Skip the separator space
     END_IF_NOK(parse_line(scene, line, cursor, line_size))
     *cursor += 1; // Skip the )
-    geom->round_r *= DIAG;
+    geom->round_r *= _diag;
 
     return res;
 }
 
 // Parse LAYER(N)
 // Where N can be any of "Fusion types"
-int parse_layer(Scene* scene, char* line, size_t* cursor, size_t line_size) {
+static int parse_layer(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     int res = OK;
     int fusion;
     *cursor += 6; // Skip LAYER(
@@ -293,7 +298,7 @@ int parse_layer(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     return res;
 }
 
-int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
+static int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
     int res = 0;
     char wkt_type[32];
     size_t wkt_type_size = 0;
@@ -345,36 +350,36 @@ int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
 
 /* Signed Distance Functions */
 
-float sign(float s) {
+static inline float sign(float s) {
     return (s > 0.0) - (s < 0.0);
 }
 
-float length2(Vec2 p) {
+static inline float length2(Vec2 p) {
     return sqrtf(p.x*p.x + p.y*p.y);
 }
 
-Vec2 add2(Vec2 a, Vec2 b) {
+static inline Vec2 add2(Vec2 a, Vec2 b) {
     return (Vec2){a.x + b.x, a.y + b.y};
 }
 
-Vec2 sub2(Vec2 a, Vec2 b) {
+static inline Vec2 sub2(Vec2 a, Vec2 b) {
     return (Vec2){a.x - b.x, a.y - b.y};
 }
 
-Vec2 mul2(Vec2 a, float s) {
+static inline Vec2 mul2(Vec2 a, float s) {
     return (Vec2){a.x * s, a.y * s};
 }
 
-float dot2(Vec2 a, Vec2 b) {
+static inline float dot2(Vec2 a, Vec2 b) {
     return a.x*b.x + a.y*b.y;
 }
 
-float cro2( Vec2 a, Vec2 b ) { 
+static inline float cro2( Vec2 a, Vec2 b ) { 
     return a.x*b.y - a.y*b.x;
 }
 
 // Smooth min using the quadratic method. Return the distance and a color mixing value
-Vec2 sminq( float a, float b, float k )
+static Vec2 sminq( float a, float b, float k )
 {
     float h = 1.0 - min( fabsf(a-b)/(6.0*k), 1.0 );
     float w = h*h*h;
@@ -385,14 +390,11 @@ Vec2 sminq( float a, float b, float k )
     return (a<b) ? ra : rb;
 }
 
-RichDistance sdMin(RichDistance a, RichDistance b) {
-    if (a.d < b.d) {
-        return a;
-    }
-    return b;
+static inline RichDistance sdMin(RichDistance a, RichDistance b) {
+    return a.d < b.d ? a : b;
 }
 
-RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
+static RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
     Vec2 sd = sminq(a.d, b.d, 1);
     RichDistance rd;
     rd.d = sd.x;
@@ -400,12 +402,12 @@ RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
     return rd;
 }
 
-RichDistance opRound(RichDistance rd, float r) {
+static inline RichDistance opRound(RichDistance rd, float r) {
     rd.d -= r; 
     return rd;
 }
 
-RichDistance sdPoint(Point p, Point a) {
+static RichDistance sdPoint(Point p, Point a) {
     RichDistance rd;
     rd.d = length2(sub2(p.v, a.v));
     copy4(rd.rgba, a.rgba);
@@ -413,7 +415,7 @@ RichDistance sdPoint(Point p, Point a) {
 }
 
 // Exact SDF for segment, from https://iquilezles.org/articles/distfunctions2d/
-RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
+static RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     RichDistance rd;
     Vec2 a = ag->point.v;
     Vec2 b = bg->point.v;
@@ -434,7 +436,7 @@ RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
     return rd;
 }
 
-Vec2 bezier(float t, Bezier* B) {
+static Vec2 bezier(float t, Bezier* B) {
     Vec2 res = {0, 0};
     const int n = B->size-1;
     for (int i = 0; i < B->size; i++) {
@@ -443,8 +445,8 @@ Vec2 bezier(float t, Bezier* B) {
     return res;
 }
 
-RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
-    float d = CANVAS_HEIGHT*CANVAS_WIDTH;
+static RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
+    float d = FLT_MAX;
 
     int min_i = 0;
     for (int i = 0; i < BEZIER_LUT_SIZE; i++) {
@@ -500,11 +502,11 @@ RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
     return rd;
 }
 
-void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distance) {
-    RichDistance d = {CANVAS_HEIGHT*CANVAS_WIDTH, {0, 0, 0, 0}};
+static void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distance) {
+    RichDistance d = DEFAULT_RD;
     Point p = {x, y};
     for (size_t i = 0; i < layer.size; i++) {
-        RichDistance gd;
+        RichDistance gd = DEFAULT_RD;
         switch (layer.geoms[i].type)
         {
         case POINT:
@@ -535,18 +537,20 @@ void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distanc
     *distance = d.d;
     float opacity = clamp(-d.d, 0.0, 1.0); // antialiasing, inside the Geom means 1, more than one pixel away means 0
     copy4(pixel, d.rgba);
-    pixel[3] *= opacity;
+    pixel[3] = opacity;
 }
 
-void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3], float *distance) {
-    *distance = CANVAS_HEIGHT*CANVAS_WIDTH;
-    float avgPixel[3] = {0, 0, 0};
+static void sdRenderScene(Scene* scene, float x, float y, float* avgPixel, float *distance) {
+    *distance = FLT_MAX;
     float pixels4[MAX_LAYER][4];
     for (int i = 0; i < scene->size; i++) {
         float d;
         sdRenderLayer(scene->layer[i], x, y, pixels4[i], &d);
         *distance = min(*distance, d);
     }
+    avgPixel[0] = 0.0;
+    avgPixel[1] = 0.0;
+    avgPixel[2] = 0.0;
     for (int i = 0; i < scene->size; i++) {
         avgPixel[0] += pixels4[i][0]*pixels4[i][3];
         avgPixel[1] += pixels4[i][1]*pixels4[i][3];
@@ -555,16 +559,55 @@ void sdRenderScene(Scene* scene, float x, float y, unsigned char pixel[3], float
     avgPixel[0] = clamp(avgPixel[0], 0.0, 1.0);
     avgPixel[1] = clamp(avgPixel[1], 0.0, 1.0);
     avgPixel[2] = clamp(avgPixel[2], 0.0, 1.0);
-    pixel[0] = (unsigned char) (avgPixel[2] * 255);
-    pixel[1] = (unsigned char) (avgPixel[1] * 255);
-    pixel[2] = (unsigned char) (avgPixel[0] * 255);
 }
 
 /* === */
 
+// Use the read_line callback to read instructions one by one, and parse them into the scene
+extern int read_scene(Scene* scene, size_t canvas_width, size_t canvas_height, int (read_line(char**, size_t*))) {
+    int res = OK;
+
+    _canvas_width = canvas_width;
+    _canvas_height = canvas_height;
+    _diag = sqrtf(canvas_width*canvas_width + canvas_height*canvas_height);
+
+    size_t len = 0;
+    int read = 0;
+    char* line = NULL;
+    while ((read = read_line(&line, &len)) != -1) {
+        size_t cursor = 0;
+        if (line[read-1] == '\n') {line[--read] = '\0';} // Remove LF
+        if (line[read-1] == '\r') {line[--read] = '\0';} // Remove CR
+        if(parse_line(scene, line, &cursor, read) != OK) {
+            LOG_E("Got error %d for line: %s", res, line);
+        }
+    }
+    return res;
+}
+
+// Render the scene, and write the resulting pixel one by one using the handle_pixel callback
+extern void render_canvas(Scene* scene, size_t canvas_width, size_t canvas_height, void (*handle_pixel)(int, int, float[3])) {
+    for (size_t y = 0; y < canvas_height; y++) {
+        size_t next_pixel = 0;
+        float last_distance = 0;
+        for (size_t x = 0; x < canvas_width; x++) {
+            float pixel[3] = {0, 0, 0};
+            if (x >= next_pixel) { // Simple optimization, since we know the distance to the next pixel
+                sdRenderScene(scene, x, y, pixel, &last_distance);
+                next_pixel = x + (int)clamp(last_distance, 0, canvas_width);
+            } else {
+                // Uncomment to see the distance as red gradiant.
+                // With the optimization, red streak means a lot of pixels are skipped.
+                // pixel[0] = clamp(last_distance / DIAG, 0, 1);
+            }
+            handle_pixel(x, y, pixel);
+        }
+    }
+}
+
+/* === Main functions === */
 
 /* BMP metadata, taken from https://stackoverflow.com/a/47785639 CC BY-SA 4.0 */
-
 const int BYTES_PER_PIXEL = 3;
 const int FILE_HEADER_SIZE = 14;
 const int INFO_HEADER_SIZE = 40;
@@ -619,19 +662,18 @@ unsigned char* create_bitmap_info_header(int height, int width) {
 
     return infoHeader;
 }
-
 /* === */
 
-int write_bitmap(Scene* scene, char* imageFileName)
-{
-    int widthInBytes = CANVAS_WIDTH * BYTES_PER_PIXEL;
+#define CANVAS_WIDTH 800
+#define CANVAS_HEIGHT 800
 
-    unsigned char padding[3] = {0, 0, 0};
-    int paddingSize = (4 - (widthInBytes) % 4) % 4;
+FILE* imageFile = NULL;
+const int widthInBytes = CANVAS_WIDTH * BYTES_PER_PIXEL;
+const int paddingSize = (4 - (widthInBytes) % 4) % 4;
+const int stride = (widthInBytes) + paddingSize;
 
-    int stride = (widthInBytes) + paddingSize;
-
-    FILE* imageFile = fopen(imageFileName, "wb");
+int create_bitmap_file(char* imageFileName) {
+    imageFile = fopen(imageFileName, "wb");
     if (imageFile == NULL) {
         LOG_E("Failed to open output file %s", imageFileName);
         return E_FILE_OPEN;
@@ -642,25 +684,28 @@ int write_bitmap(Scene* scene, char* imageFileName)
 
     unsigned char* infoHeader = create_bitmap_info_header(CANVAS_HEIGHT, CANVAS_WIDTH);
     fwrite(infoHeader, 1, INFO_HEADER_SIZE, imageFile);
+    return OK;
+}
 
-    for (int y = 0; y < CANVAS_HEIGHT; y++) {
-        int next_pixel = 0;
-        float last_distance = 0;
-        for (int x = 0; x < CANVAS_WIDTH; x++) {
-            unsigned char pixel[] = {0, 0, 0};
-            if (x >= next_pixel) { // Simple optimization, since we know the distance to the next pixel
-                sdRenderScene(scene, x, y, pixel, &last_distance);
-                next_pixel = x + (int) last_distance;
-            } else {
-                // Uncomment to see the effect of the optimization. Red means pixels are skipped
-                // pixel[2] = (unsigned char) clamp(last_distance, 0, 255);
-            }
-            fwrite(pixel, BYTES_PER_PIXEL, 1, imageFile);
-        }
-        fwrite(padding, 1, paddingSize, imageFile);
+void write_bitmap_pixel(int x, int y, float pixel[3]) {
+    if (x >= CANVAS_WIDTH || y >= CANVAS_HEIGHT) {
+        return;
     }
 
-    fclose(imageFile);
+    unsigned char data[3];
+    data[0] = (unsigned char) (pixel[2] * 255);
+    data[1] = (unsigned char) (pixel[1] * 255);
+    data[2] = (unsigned char) (pixel[0] * 255);
+    fwrite(data, BYTES_PER_PIXEL, 1, imageFile);
+    if (x == CANVAS_WIDTH - 1) {
+        unsigned char padding[3] = {0, 0, 0};
+        fwrite(padding, 1, paddingSize, imageFile);
+    }
+}
+
+FILE* inputFile = NULL;
+int read_instruction_line(char** line, size_t* len) {
+    return getline(line, len, inputFile);
 }
 
 int render_file(char* input, char* output) {
@@ -673,33 +718,29 @@ int render_file(char* input, char* output) {
     size_t len = 0;
     ssize_t read;
 
-    FILE* fp = fopen(input, "r");
-    if (fp == NULL) {
+    inputFile = fopen(input, "r");
+    if (inputFile == NULL) {
         LOG_E("Failed to open input file %s", input);
         return E_FILE_OPEN;
     }
 
-    while ((read = getline(&line, &len, fp)) != -1) {
-        size_t cursor = 0;
-        if (line[read-1] == '\n') {line[--read] = '\0';} // Remove LF (insufficient for Windows LFCR)
-        if(parse_line(&scene, line, &cursor, read) != OK) {
-            LOG_E("Got error %d for line: %s", res, line);
-        }
-    }
+    read_scene(&scene, CANVAS_WIDTH, CANVAS_HEIGHT, &read_instruction_line);
 
-    fclose(fp);
+    fclose(inputFile);
     if (line) {
         free(line);
     }
 
-    res = write_bitmap(&scene, "canvas.bmp");
+    res = create_bitmap_file("canvas.bmp");
+    if (res == OK) {
+        render_canvas(&scene, CANVAS_WIDTH, CANVAS_HEIGHT, &write_bitmap_pixel);
+        fclose(imageFile);
+    }
 
     return res;
 }
 
 int main(int argc, char* argv[]) {
-    DIAG = sqrtf(CANVAS_WIDTH*CANVAS_WIDTH + CANVAS_HEIGHT*CANVAS_HEIGHT);
-
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <inputFile>\n", argv[0]);
         return EXIT_FAILURE;
@@ -709,3 +750,4 @@ int main(int argc, char* argv[]) {
 
     exit(EXIT_SUCCESS);
 }
+/* ====== */
