@@ -54,6 +54,7 @@
 #define MAX_BEZIER_POINT 11
 #define BEZIER_MAX_ITERATIONS 10
 #define BEZIER_EPSILON 1e-6
+#define SMOOTH_MIN_FACTOR 1.5
 
 // Global rendering parameters set at runtime
 static int _canvas_width = 0;
@@ -315,8 +316,8 @@ static void set_bbox_bezier(Geom* g) {
     for (size_t i = 1; i < g->bezier.size; i++) {
         g->bbox.bl.x = min(g->bbox.bl.x, g->bezier.points[i]->point.v.x);
         g->bbox.bl.y = min(g->bbox.bl.y, g->bezier.points[i]->point.v.y);
-        g->bbox.ur.x = max(g->bbox.bl.x, g->bezier.points[i]->point.v.x);
-        g->bbox.ur.y = max(g->bbox.bl.y, g->bezier.points[i]->point.v.y);
+        g->bbox.ur.x = max(g->bbox.ur.x, g->bezier.points[i]->point.v.x);
+        g->bbox.ur.y = max(g->bbox.ur.y, g->bezier.points[i]->point.v.y);
     }
 }
 
@@ -379,6 +380,10 @@ static inline float sign(float s) {
     return (s > 0.0) - (s < 0.0);
 }
 
+static inline Vec2 max2(Vec2 a, Vec2 b) {
+    return (Vec2){max(a.x, b.x), max(a.y, b.y)};
+}
+
 static inline Vec2 add2(Vec2 a, Vec2 b) {
     return (Vec2){a.x + b.x, a.y + b.y};
 }
@@ -433,7 +438,7 @@ static inline RichDistance sdMin(RichDistance a, RichDistance b) {
 }
 
 static RichDistance sdSmoothMin(RichDistance a, RichDistance b) {
-    Vec2 sd = sminq(a.d, b.d, 1);
+    Vec2 sd = sminq(a.d, b.d, SMOOTH_MIN_FACTOR);
     RichDistance rd;
     rd.d = sd.x;
     mix4(rd.rgba, a.rgba, b.rgba, sd.y);
@@ -478,15 +483,12 @@ static RichDistance sdSegment(Point p, Geom* ag, Geom* bg ) {
 static Vec2 bezier(float t, Bezier* B) {
     Vec2 temp[MAX_BEZIER_POINT];
     
-    // Copy initial points
     for (size_t i = 0; i < B->size; i++) {
         temp[i] = B->points[i]->point.v;
     }
     
-    // De Casteljau's algorithm
     for (size_t r = 1; r < B->size; r++) {
         for (size_t i = 0; i < B->size - r; i++) {
-            // temp[i] = add2(mul2(temp[i], 1.0f - t), mul2(temp[i + 1], t));
             temp[i] = lerp2(temp[i], temp[i+1], t);
         }
     }
@@ -595,10 +597,20 @@ static void sdRenderLayer(Layer* layer, float x, float y, float pixel[4], float*
             gd = opRound(sdPoint(p, layer->geoms[i].point), layer->geoms[i].round_r);
             break;
         case SEGMENT:
-            gd = opRound(sdSegment(p, layer->geoms[i].segment.a, layer->geoms[i].segment.b), layer->geoms[i].round_r);
+            dbb = distanceBbox(layer->geoms[i].bbox, x, y);
+            if (dbb-(SMOOTH_MIN_FACTOR*5) <= 0) {
+                gd = opRound(sdSegment(p, layer->geoms[i].segment.a, layer->geoms[i].segment.b), layer->geoms[i].round_r);
+            } else {
+                gd.d = dbb;
+            }
             break;
         case BEZIER:
-            gd = opRound(sdApproximateBezier(p, &(layer->geoms[i].bezier)), layer->geoms[i].round_r);
+            dbb = distanceBbox(layer->geoms[i].bbox, x, y);
+            if (dbb-(SMOOTH_MIN_FACTOR*5) <= 0) {
+                gd = opRound(sdApproximateBezier(p, &(layer->geoms[i].bezier)), layer->geoms[i].round_r);
+            } else {
+                gd.d = dbb;
+            }
             break;
         default:
             break;
