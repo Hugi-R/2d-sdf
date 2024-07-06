@@ -82,6 +82,11 @@ typedef struct Vec2 {
     float y;
 } Vec2;
 
+typedef struct Bbox {
+    Vec2 bl; // Bottom Left corner
+    Vec2 ur; // Upper Right corner
+} Bbox;
+
 struct Point {
     Vec2 v;
     float rgba[4];
@@ -104,12 +109,14 @@ struct Geom {
     Segment segment;
     Bezier bezier;
     float round_r;
+    Bbox bbox;
 };
 
 struct Layer {
     int fusion; // See "Fusion types"
     Geom geoms[MAX_GEOMS_PER_LAYER];
     size_t size;
+    Bbox bbox;
 };
 
 struct Scene {
@@ -266,6 +273,11 @@ static int parse_round(Scene* scene, char* line, size_t* cursor, size_t line_siz
     *cursor += 1; // Skip the )
     geom->round_r *= _diag;
 
+    geom->bbox.bl.x -= (ceilf(geom->round_r) + 1);
+    geom->bbox.bl.y -= (ceilf(geom->round_r) + 1);
+    geom->bbox.ur.x += (ceilf(geom->round_r) + 1);
+    geom->bbox.ur.y += (ceilf(geom->round_r) + 1);
+
     return res;
 }
 
@@ -283,6 +295,29 @@ static int parse_layer(Scene* scene, char* line, size_t* cursor, size_t line_siz
     scene->layer[scene->size - 1].size = 0;
 
     return res;
+}
+
+static void set_bbox_point(Geom* g) {
+    g->bbox.bl = g->point.v;
+    g->bbox.ur = g->point.v;
+}
+
+static void set_bbox_segment(Geom* g) {
+    g->bbox.bl.x = min(g->segment.a->point.v.x, g->segment.b->point.v.x);
+    g->bbox.bl.y = min(g->segment.a->point.v.y, g->segment.b->point.v.y);
+    g->bbox.ur.x = max(g->segment.a->point.v.x, g->segment.b->point.v.x);
+    g->bbox.ur.y = max(g->segment.a->point.v.y, g->segment.b->point.v.y);
+}
+
+static void set_bbox_bezier(Geom* g) {
+    g->bbox.bl = g->bezier.points[0]->point.v;
+    g->bbox.ur = g->bezier.points[0]->point.v;
+    for (size_t i = 1; i < g->bezier.size; i++) {
+        g->bbox.bl.x = min(g->bbox.bl.x, g->bezier.points[i]->point.v.x);
+        g->bbox.bl.y = min(g->bbox.bl.y, g->bezier.points[i]->point.v.y);
+        g->bbox.ur.x = max(g->bbox.bl.x, g->bezier.points[i]->point.v.x);
+        g->bbox.ur.y = max(g->bbox.bl.y, g->bezier.points[i]->point.v.y);
+    }
 }
 
 static int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size) {
@@ -318,14 +353,17 @@ static int parse_line(Scene* scene, char* line, size_t* cursor, size_t line_size
     } else if (strcmp(wkt_type, "POINT") == 0) {
         layer->geoms[layer->size].type = POINT;
         END_IF_NOK(parse_point(line, cursor, line_size, &(layer->geoms[layer->size].point)))
+        set_bbox_point(&(layer->geoms[layer->size]));
         layer->size += 1;
     } else if (strcmp(wkt_type, "SEGMENT") == 0) {
         layer->geoms[layer->size].type = SEGMENT;
         END_IF_NOK(parse_segment(layer, line, cursor, line_size, &(layer->geoms[layer->size].segment)))
+        set_bbox_segment(&(layer->geoms[layer->size]));
         layer->size += 1;
     } else if (strcmp(wkt_type, "BEZIER") == 0) {
         layer->geoms[layer->size].type = BEZIER;
         END_IF_NOK(parse_bezier(layer, line, cursor, line_size, &(layer->geoms[layer->size].bezier)))
+        set_bbox_bezier(&(layer->geoms[layer->size]));
         layer->size += 1;
     } else {
         LOG_E("Unsuported word %s in line %s", wkt_type, line);
@@ -375,10 +413,7 @@ static float squaredDistance2(Vec2 a, Vec2 b) {
 }
 
 static inline Vec2 lerp2(Vec2 a, Vec2 b, float t) {
-    Vec2 result;
-    result.x = (1-t) * a.x + t * b.x;
-    result.y = (1-t) * a.y + t * b.y;
-    return result;
+    return (Vec2){mix(a.x, b.x, t), mix(a.y, b.y, t)};
 }
 
 // Smooth min using the quadratic method. Return the distance and a color mixing value
@@ -527,27 +562,49 @@ static RichDistance sdApproximateBezier(Point pos, Bezier* bez) {
     return rd;
 }
 
-static void sdRenderLayer(Layer layer, float x, float y, float pixel[4], float* distance) {
+float distanceBbox(Bbox bbox, float x, float y) {
+    if (x < bbox.bl.x) {
+        return (bbox.bl.x - x);
+    }
+    if (y < bbox.bl.y) {
+        return (bbox.bl.y - y);
+    }
+    if (x > bbox.ur.x) {
+        return (x - bbox.ur.x);
+    }
+    if (y > bbox.ur.y) {
+        return (y - bbox.ur.y);
+    }
+    return -1;
+}
+
+static void sdRenderLayer(Layer* layer, float x, float y, float pixel[4], float* distance) {
+    float dbb = distanceBbox(layer->bbox, x, y);
+    if (dbb > 0) {
+        *distance = dbb;
+        return;
+    }
+    
     RichDistance d = DEFAULT_RD;
     Point p = {x, y};
-    for (size_t i = 0; i < layer.size; i++) {
+    for (size_t i = 0; i < layer->size; i++) {
         RichDistance gd = DEFAULT_RD;
-        switch (layer.geoms[i].type)
+        switch (layer->geoms[i].type)
         {
         case POINT:
-            gd = opRound(sdPoint(p, layer.geoms[i].point), layer.geoms[i].round_r);
+            gd = opRound(sdPoint(p, layer->geoms[i].point), layer->geoms[i].round_r);
             break;
         case SEGMENT:
-            gd = opRound(sdSegment(p, layer.geoms[i].segment.a, layer.geoms[i].segment.b), layer.geoms[i].round_r);
+            gd = opRound(sdSegment(p, layer->geoms[i].segment.a, layer->geoms[i].segment.b), layer->geoms[i].round_r);
             break;
         case BEZIER:
-            gd = opRound(sdApproximateBezier(p, &(layer.geoms[i].bezier)), layer.geoms[i].round_r);
+            gd = opRound(sdApproximateBezier(p, &(layer->geoms[i].bezier)), layer->geoms[i].round_r);
             break;
         default:
             break;
         }
 
-        switch (layer.fusion)
+        switch (layer->fusion)
         {
         case F_MIN:
             d = sdMin(d, gd);
@@ -570,7 +627,7 @@ static void sdRenderScene(Scene* scene, float x, float y, float* avgPixel, float
     float pixels4[MAX_LAYER][4];
     for (int i = 0; i < scene->size; i++) {
         float d;
-        sdRenderLayer(scene->layer[i], x, y, pixels4[i], &d);
+        sdRenderLayer(&(scene->layer[i]), x, y, pixels4[i], &d);
         *distance = min(*distance, d);
     }
     avgPixel[0] = 0.0;
@@ -607,6 +664,21 @@ extern int read_scene(Scene* scene, size_t canvas_width, size_t canvas_height, i
             LOG_E("Got error %d for line: %s", res, line);
         }
     }
+
+    // Compute Layer bbox
+    for (size_t i = 0; i < scene->size; i++) {
+        Layer* l = &(scene->layer[i]);
+        Geom g = l->geoms[0];
+        l->bbox.bl = g.bbox.bl;
+        l->bbox.ur = g.bbox.ur;
+        for (size_t j = 1; j < l->size; j++) {
+            g = l->geoms[j];
+            l->bbox.bl.x = min(l->bbox.bl.x, g.bbox.bl.x);
+            l->bbox.bl.y = min(l->bbox.bl.y, g.bbox.bl.y);
+            l->bbox.ur.x = max(l->bbox.ur.x, g.bbox.ur.x);
+            l->bbox.ur.y = max(l->bbox.ur.y, g.bbox.ur.y);
+        }
+    }
     return res;
 }
 
@@ -623,7 +695,7 @@ extern void render_canvas(Scene* scene, size_t canvas_width, size_t canvas_heigh
             } else {
                 // Uncomment to see the distance as red gradiant.
                 // With the optimization, red streak means a lot of pixels are skipped.
-                // pixel[0] = clamp(last_distance / DIAG, 0, 1);
+                // pixel[0] = clamp(last_distance / _diag, 0, 1);
             }
             handle_pixel(x, y, pixel);
         }
