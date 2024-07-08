@@ -2,6 +2,8 @@
 A simple software capable of rendering some 2D geometries, using their Signed Distance Function.
 The geometries are defined using a simple instruction format, inspired by WKT notation.
 
+Try the demo: [https://hugi-r.github.io/2d-sdf/](https://hugi-r.github.io/2d-sdf/)
+
 This serve no practical purpose, other than playing with SDF outside of a shader.
 
 | examples/data.wtk | examples/grid.wkt |
