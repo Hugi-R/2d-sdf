@@ -11,7 +11,7 @@ This serve no practical purpose, other than playing with SDF outside of a shader
 ## Quickstart
 Build:
 ```shell
-gcc main.c -lm -O3
+gcc render.c main.c -lm -O3
 ```
 
 Run:
@@ -21,6 +21,16 @@ Run:
 The result is a BMP `canvas.bmp`.
 ```shell
 feh canvas.bmp
+```
+
+### Build the web demo
+```shell
+emcc -fsanitize=address -O3 -sEXPORTED_RUNTIME_METHODS=cwrap  -s EXPORTED_FUNCTIONS="['_version', '_load_instructions', '_free_instructions', '_render', '_create_result_buffer', '_destroy_result_buffer']" -Wl,--no-entry "webdemo/webdemo.c" "render.c" -o "webdemo/webdemo.out.js"
+```
+
+You can serve the demo localy with
+```shell
+python -m http.server 8080 --bind 0.0.0.0 --directory webdemo
 ```
 
 ## Supported geometries and operations
