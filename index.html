@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <title>2D SDF demo</title>
+    <script src="webdemo.out.js"></script>
+    <style>
+        body {
+            display: flex;
+            height: 100vh;
+            margin: 0;
+            padding: 5px;
+        }
+        #result {
+            flex: 1;
+        }
+        #controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        #instructions-container {
+            display: flex;
+            flex-direction: column;
+            width: 100em;
+            padding: 5px;
+        }
+        #instructions {
+            flex: 1;
+            resize: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="result">
+        <canvas width="800" height="800"></canvas>
+    </div>
+    <div id="instructions-container">
+        <div id="controls">
+            <button onclick="trigger_render()">Render</button>
+            <input type="number" id="canvas_width" placeholder="Width" value="800" style="width: 70px;">
+            <input type="number" id="canvas_height" placeholder="Height" value="800" style="width: 70px;">
+        </div>
+        <textarea id="instructions" placeholder="Enter text here">
+LAYER(1)
+ROUND(0.08 POINT(0.5 0.5 COLOR(1 0.5 0.1 1)))
+ROUND(0.05 POINT(0.8 0.8 COLOR(0.5 1 0.5 1)))
+ROUND(0.03 POINT(0.8 0.5 COLOR(0.1 0.5 1 1)))
+ROUND(0.01 SEGMENT(0 1))
+ROUND(0.01 SEGMENT(1 2))
+ROUND(0.01 SEGMENT(2 0))
+LAYER(0)
+POINT(0.0 0.0)
+POINT(0.05 1.0)
+POINT(0.1 0.0)
+POINT(0.1 1.0)
+POINT(0.2 0.0)
+POINT(0.15 1.0)
+POINT(0.025 0.5)
+POINT(0.175 0.5)
+ROUND(0.005 SEGMENT(0 1))
+ROUND(0.005 SEGMENT(2 3))
+ROUND(0.005 SEGMENT(4 5))
+ROUND(0.005 SEGMENT(0 4))
+ROUND(0.005 SEGMENT(1 5))
+ROUND(0.005 SEGMENT(6 7))
+LAYER(0)
+ROUND(0.004 POINT(0.8 0.1 COLOR(0 1 0 0.5)))
+ROUND(0.004 POINT(0.7 0.6 COLOR(0 1 0 0.5)))
+ROUND(0.004 POINT(0.6 -0.5 COLOR(0 1 0 0.5)))
+ROUND(0.004 POINT(0.5 0.6 COLOR(0 1 0 0.5)))
+ROUND(0.004 POINT(0.4 0.1 COLOR(0 1 0 0.5)))
+ROUND(0.001 SEGMENT(0 1))
+ROUND(0.001 SEGMENT(1 2))
+ROUND(0.001 SEGMENT(2 3))
+ROUND(0.001 SEGMENT(3 4))
+ROUND(0.005 BEZIER(0 1 2 3 4))
+LAYER(1)
+ROUND(0.003 POINT(0.3 0.6 COLOR(0 0 1 0.6)))
+ROUND(0.003 POINT(0.3 0.8 COLOR(1 0 0 0.6)))
+ROUND(0.003 POINT(0.3 0.9 COLOR(1 0 0 0.6)))
+ROUND(0.003 POINT(0.45 0.9 COLOR(1 0 0 0.6)))
+ROUND(0.003 POINT(0.45 0.8 COLOR(1 0 0 0.6)))
+ROUND(0.003 POINT(0.45 0.7 COLOR(1 0 0 0.6)))
+ROUND(0.003 POINT(0.3 0.7 COLOR(1 0 0 0.6)))
+ROUND(0.006 BEZIER(0 1 2 3 4 5 6))
+</textarea>
+    </div>
+</body>
+</html>
+<script>
+    var api = null;
+
+    function trigger_render() {
+        const textBoxContent = document.getElementById('instructions').value;
+        const canvasWidth = document.getElementById('canvas_width').value;
+        const canvasHeight = document.getElementById('canvas_height').value;
+
+        render_in_canvas(textBoxContent, canvasWidth, canvasHeight);
+    }
+
+    function createCanvasFromRGBAData(data, width, height) {
+        let canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        let ctx = canvas.getContext("2d");
+        let imgData = ctx.createImageData(width, height);
+        for(let i = 0; i < data.length; i+=4) {
+            x = Math.floor(i/4)%width;
+            y = Math.floor((i/4)/width);
+            // The Y-axis of the canvas is flipped
+            imgData.data[((height-y)*width + x)*4+0] = data[(y*width + x)*4+0];
+            imgData.data[((height-y)*width + x)*4+1] = data[(y*width + x)*4+1];
+            imgData.data[((height-y)*width + x)*4+2] = data[(y*width + x)*4+2];
+            imgData.data[((height-y)*width + x)*4+3] = data[(y*width + x)*4+3];
+        }
+        ctx.putImageData(imgData, 0, 0);
+        return canvas;
+    }
+
+    function render_in_canvas(inst, width, height) {
+        if (api === null) {
+            return;
+        }
+        api.load_instructions(inst);
+        data_ptr = api.create_result_buffer(width, height);
+        api.render();
+        const resultView = new Uint8Array(
+            Module.HEAP8.buffer,
+            data_ptr,
+            width*height*4,
+        );
+        canvas = createCanvasFromRGBAData(resultView, width, height);
+        document.getElementById("result").replaceChildren(canvas);
+        api.free_instructions();
+        api.destroy_result_buffer();
+    }
+
+    Module.onRuntimeInitialized = async () => {
+        api = {
+            version: Module.cwrap("version", "number", []),
+            load_instructions: Module.cwrap("load_instructions", "number", ["string"]),
+            free_instructions: Module.cwrap("free_instructions", null, []),
+            render: Module.cwrap("render", "number", []),
+            create_result_buffer: Module.cwrap("create_result_buffer", "number", ["number", "number"]),
+            destroy_result_buffer: Module.cwrap("destroy_result_buffer", null, []),
+        };
+    };
+</script>
